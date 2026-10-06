@@ -308,6 +308,8 @@ const APPLETS = ("ls ll cat grep sed head tail wc sort uniq echo pwd cut tr od x
   "true false yes seq printf clear tee less more vi awk ps top kill du df stat readlink realpath " +
   "wget tar gzip gunzip md5sum sha256sum base64 nl tac rev fold xargs which mktemp").split(" ");
 function installApplets(FS){ for (const a of APPLETS){ try{ FS.symlink("/bin/busybox", "/bin/"+a); }catch(e){} } }
+// root's login shell is bash, not Alpine's /bin/sh (busybox): $SHELL, su and vi's :sh give bash
+function bashLogin(FS){ try { FS.writeFile("/etc/passwd", FS.readFile("/etc/passwd", { encoding: "utf8" }).replace(/^(root:.*:)\/bin\/sh$/m, "$1/bin/bash")); } catch(e){} }
 
 // static, machine-level /proc nodes so `cat /proc/cpuinfo`, `uptime`, `free` and
 // `top` (which reads /proc/stat + /proc/meminfo) work. The per-process /proc/<pid>
@@ -556,10 +558,10 @@ async function bootTab(t, cmd){
       if (typeof mod.addRunDependency === "function"){
         mod.addRunDependency("rootfs-untar");
         untarAsync(tar, FS, frac => bootStatus(term, "unpacking the file system… " + Math.round(frac*100) + "%"))
-          .then(()=>{ installApplets(FS); writeProcStatic(FS); try { FS.writeFile("/root/.bloprc", BANNER_RC); FS.writeFile("/root/hi.c", HI_C); } catch(e){}
+          .then(()=>{ installApplets(FS); bashLogin(FS); writeProcStatic(FS); try { FS.writeFile("/root/.bloprc", BANNER_RC); FS.writeFile("/root/hi.c", HI_C); } catch(e){}
                       mod.removeRunDependency("rootfs-untar"); });
       } else {
-        untar(tar, FS); installApplets(FS); writeProcStatic(FS);
+        untar(tar, FS); installApplets(FS); bashLogin(FS); writeProcStatic(FS);
         try { FS.writeFile("/root/.bloprc", BANNER_RC); FS.writeFile("/root/hi.c", HI_C); } catch(e){}
       }
       const ICANON = 0x2, ECHO = 0x8, VMIN = 6;
