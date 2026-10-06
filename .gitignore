@@ -1,0 +1,9 @@
+# blink source tree, rebuilt by scripts/fetch-blink.sh (never vendored)
+/blink/
+# the guest system and its sources: release assets, built by make rootfs and make sources
+/web/rootfs.tar
+/dist/
+# local deployment targets, included by the Makefile when present
+/deploy/
+*.o
+.DS_Store

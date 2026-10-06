@@ -1,0 +1,97 @@
+From 089232ccbdca299009010546ad12f9ee73706766 Mon Sep 17 00:00:00 2001
+From: Christopher AMIAUD <christopher.amiaud@gmail.com>
+Date: Mon, 5 Oct 2026 12:25:58 +0200
+Subject: [PATCH 7/9] Reap orphans of threaded fork()
+
+A process whose parent exited was never reaped, since only its parent
+can wait4() for it, so its thread, stack and address space leaked for
+good: a shell running `sh -c 'sleep 9 & sleep 9 & kill 0'` in a loop
+ran out of memory after a few dozen iterations.
+
+As on Linux, such a process is now given to init: its ppid becomes 1,
+and blink reaps it once it ends, from the next process that forks or
+waits, since a thread can't free itself. A stopped orphan gets SIGHUP
+then SIGCONT, like the members of an orphaned process group.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ blink/threadfork.c | 42 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/blink/threadfork.c b/blink/threadfork.c
+index 7396a6a..8f98cc6 100644
+--- a/blink/threadfork.c
++++ b/blink/threadfork.c
+@@ -178,6 +178,45 @@ static void Signal(struct Proc *p, int sig) {
+   EnqueueSignal(p->m, sig);
+ }
+ 
++// a process whose parent exited is given to init, as on Linux, which
++// here means its ppid becomes 1 and blink itself reaps it once it ends.
++// if it's stopped, SIGHUP and SIGCONT spare it from waiting forever.
++static void ReparentChildren(int ppid) {
++  struct Proc *p;
++  for (p = g_procs.list; p; p = p->next) {
++    if (p->ppid == ppid) {
++      p->ppid = 1;
++      if (p->stopped) {
++        Signal(p, SIGHUP_LINUX);
++        Signal(p, SIGCONT_LINUX);
++      }
++    }
++  }
++}
++
++// frees the orphans which ended. it's called by a process that forks
++// or waits, since a thread can't free itself
++static void ReapOrphans(void) {
++  struct Proc **pp, *p, *dead = 0;
++  LOCK(&g_procs.lock);
++  for (pp = &g_procs.list; (p = *pp);) {
++    if (p->zombie && p->ppid == 1) {
++      *pp = p->next;
++      p->next = dead;
++      dead = p;
++    } else {
++      pp = &p->next;
++    }
++  }
++  UNLOCK(&g_procs.lock);
++  while ((p = dead)) {
++    dead = p->next;
++    unassert(!pthread_join(p->thread, 0));
++    FreeMachine(p->m);
++    free(p);
++  }
++}
++
+ static void NotifyParent(struct Proc *p) {
+   struct Proc *parent;
+   if ((parent = FindProc(p->ppid))) Signal(parent, SIGCHLD_LINUX);
+@@ -200,6 +239,7 @@ void AddMainProcess(struct Machine *m) {
+ // registers child system `s` of process `ppid` and assigns its pid
+ int AddChildProcess(struct System *s, int ppid) {
+   struct Proc *p, *parent;
++  ReapOrphans();
+   if (!(p = (struct Proc *)calloc(1, sizeof(*p)))) return enomem();
+   LOCK(&g_procs.lock);
+   p->pid = s->pid = ++g_procs.lastpid;
+@@ -276,6 +316,7 @@ _Noreturn void ExitChildProcess(struct Machine *m, int wstatus) {
+     p->m = m;
+     p->wstatus = wstatus;
+     p->zombie = true;
++    ReparentChildren(p->pid);
+     NotifyParent(p);
+   }
+   UNLOCK(&g_procs.lock);
+@@ -306,6 +347,7 @@ int WaitChildProcess(struct Machine *m, int pid, i64 wstatusaddr, int options,
+   struct rusage_linux gru;
+   int rc, ws, pgid, self = m->system->pid;
+   if ((options = XlatWait(options)) == -1) return -1;
++  ReapOrphans();
+   if ((wstatusaddr &&
+        !IsValidMemory(m, wstatusaddr, sizeof(gwstatus), PROT_WRITE)) ||
+       (rusageaddr && !IsValidMemory(m, rusageaddr, sizeof(gru), PROT_WRITE))) {
+-- 
+2.53.0
+

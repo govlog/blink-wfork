@@ -1,0 +1,480 @@
+From 5c06fb8b82edc8b54bf545d0c2a9f23755ec6b4f Mon Sep 17 00:00:00 2001
+From: Christopher AMIAUD <christopher.amiaud@gmail.com>
+Date: Mon, 5 Oct 2026 10:36:03 +0200
+Subject: [PATCH 4/9] Implement pipes in-process for threaded fork()
+
+Emscripten's pipes don't report end of file reliably once processes
+are threads sharing the host's fds, so the reader of a pipeline could
+wait forever. Under HAVE_THREADED_FORK, a pipe is now a ring buffer
+in blink that counts the fds open on either end. Writes block while
+it's full, and fail with EPIPE once no reader is left.
+
+sendfile() now goes through the fd callbacks, as read() and write()
+do, so it works with these pipes too. It also resumes a partial write
+where it stopped, instead of writing the start of the buffer again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ blink/errno.c   |  12 +++
+ blink/errno.h   |   3 +
+ blink/pipe.c    | 210 ++++++++++++++++++++++++++++++++++++++++++++++++
+ blink/syscall.c |  61 +++++++++++---
+ blink/syscall.h |   8 ++
+ 5 files changed, 281 insertions(+), 13 deletions(-)
+
+diff --git a/blink/errno.c b/blink/errno.c
+index 9403455..d34ecc8 100644
+--- a/blink/errno.c
++++ b/blink/errno.c
+@@ -80,6 +80,18 @@ long echild(void) {
+   return ReturnErrno(ECHILD);
+ }
+ 
++long epipe(void) {
++  return ReturnErrno(EPIPE);
++}
++
++long espipe(void) {
++  return ReturnErrno(ESPIPE);
++}
++
++long enotty(void) {
++  return ReturnErrno(ENOTTY);
++}
++
+ long eperm(void) {
+   return ReturnErrno(EPERM);
+ }
+diff --git a/blink/errno.h b/blink/errno.h
+index 4f624ae..6061879 100644
+--- a/blink/errno.h
++++ b/blink/errno.h
+@@ -20,6 +20,9 @@ long erange(void);
+ long eperm(void);
+ long esrch(void);
+ long echild(void);
++long epipe(void);
++long espipe(void);
++long enotty(void);
+ long enodev(void);
+ long eacces(void);
+ long eisdir(void);
+diff --git a/blink/pipe.c b/blink/pipe.c
+index 9b594ed..e1c7ea0 100644
+--- a/blink/pipe.c
++++ b/blink/pipe.c
+@@ -18,6 +18,8 @@
+ ╚─────────────────────────────────────────────────────────────────────────────*/
+ #include <errno.h>
+ #include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -29,12 +31,217 @@
+ #include "blink/errno.h"
+ #include "blink/fds.h"
+ #include "blink/log.h"
++#include "blink/macros.h"
+ #include "blink/ndelay.h"
+ #include "blink/syscall.h"
+ #include "blink/thread.h"
+ #include "blink/vfs.h"
+ #include "blink/xlat.h"
+ 
++#ifdef HAVE_THREADED_FORK
++// Pipes for threaded fork()
++//
++// Guest processes share the host's fds then, and emscripten pipes stop
++// reporting eof reliably, so pipes are implemented here instead. Each
++// is a ring buffer, plus how many fds are open on either end. The host
++// side of a pipe fd is a handle: kPipeHandle | slot << 1 | write end.
++
++#define kPipeSize 65536
++#define kMaxPipes 256
++
++struct Pipe {
++  bool used;
++  int readers;
++  int writers;
++  size_t head;
++  size_t len;
++  u8 *buf;
++  pthread_cond_t_ cond;
++};
++
++static struct Pipes {
++  pthread_mutex_t_ lock;
++  struct Pipe p[kMaxPipes];
++} g_pipes = {
++    PTHREAD_MUTEX_INITIALIZER_,
++};
++
++static struct Pipe *GetPipe(int handle) {
++  return g_pipes.p + ((handle & ~kPipeHandle) >> 1);
++}
++
++static int OpenPipe(int handles[2]) {
++  int i;
++  u8 *buf;
++  struct Pipe *p;
++  if (!(buf = (u8 *)malloc(kPipeSize))) return enomem();
++  LOCK(&g_pipes.lock);
++  for (i = 0; i < kMaxPipes && g_pipes.p[i].used; ++i) {
++  }
++  if (i == kMaxPipes) {
++    UNLOCK(&g_pipes.lock);
++    free(buf);
++    return enfile();
++  }
++  p = g_pipes.p + i;
++  p->used = true;
++  p->readers = 1;
++  p->writers = 1;
++  p->head = 0;
++  p->len = 0;
++  p->buf = buf;
++  unassert(!pthread_cond_init(&p->cond, 0));
++  UNLOCK(&g_pipes.lock);
++  handles[0] = kPipeHandle | i << 1;
++  handles[1] = kPipeHandle | i << 1 | 1;
++  return 0;
++}
++
++int DupPipe(int handle) {
++  LOCK(&g_pipes.lock);
++  if (handle & 1) {
++    ++GetPipe(handle)->writers;
++  } else {
++    ++GetPipe(handle)->readers;
++  }
++  UNLOCK(&g_pipes.lock);
++  return handle;
++}
++
++static int ClosePipe(int handle) {
++  struct Pipe *p = GetPipe(handle);
++  LOCK(&g_pipes.lock);
++  if (handle & 1) {
++    --p->writers;
++  } else {
++    --p->readers;
++  }
++  if (p->readers || p->writers) {
++    unassert(!pthread_cond_broadcast(&p->cond));
++  } else {
++    free(p->buf);
++    unassert(!pthread_cond_destroy(&p->cond));
++    p->used = false;
++  }
++  UNLOCK(&g_pipes.lock);
++  return 0;
++}
++
++// blocks until there's data, or returns 0 once every writer is closed
++static ssize_t ReadPipe(int handle, const struct iovec *iov, int iovcnt) {
++  int i;
++  size_t n, off, got = 0;
++  struct Pipe *p = GetPipe(handle);
++  LOCK(&g_pipes.lock);
++  while (!p->len && p->writers) {
++    unassert(!pthread_cond_wait(&p->cond, &g_pipes.lock));
++  }
++  for (i = 0; i < iovcnt && p->len; ++i) {
++    for (off = 0; off < iov[i].iov_len && p->len; off += n) {
++      n = MIN(MIN(p->len, kPipeSize - p->head), iov[i].iov_len - off);
++      memcpy((u8 *)iov[i].iov_base + off, p->buf + p->head, n);
++      p->head = (p->head + n) % kPipeSize;
++      p->len -= n;
++      got += n;
++    }
++  }
++  unassert(!pthread_cond_broadcast(&p->cond));
++  UNLOCK(&g_pipes.lock);
++  return got;
++}
++
++// blocks until everything is written, or fails with EPIPE once every
++// reader is closed, in which case a partial write is reported as such
++static ssize_t WritePipe(int handle, const struct iovec *iov, int iovcnt) {
++  int i;
++  size_t n, off, tail, put = 0;
++  struct Pipe *p = GetPipe(handle);
++  LOCK(&g_pipes.lock);
++  for (i = 0; i < iovcnt; ++i) {
++    for (off = 0; off < iov[i].iov_len; off += n) {
++      while (p->len == kPipeSize && p->readers) {
++        unassert(!pthread_cond_wait(&p->cond, &g_pipes.lock));
++      }
++      if (!p->readers) {
++        UNLOCK(&g_pipes.lock);
++        return put ? put : epipe();
++      }
++      tail = (p->head + p->len) % kPipeSize;
++      n = MIN(MIN(kPipeSize - p->len, kPipeSize - tail), iov[i].iov_len - off);
++      memcpy(p->buf + tail, (const u8 *)iov[i].iov_base + off, n);
++      p->len += n;
++      put += n;
++      unassert(!pthread_cond_broadcast(&p->cond));
++    }
++  }
++  UNLOCK(&g_pipes.lock);
++  return put;
++}
++
++static int PollPipe(struct pollfd *fds, nfds_t nfds, int timeout) {
++  int ev = 0;
++  struct Pipe *p = GetPipe(fds[0].fd);
++  unassert(nfds == 1);
++  LOCK(&g_pipes.lock);
++  if (fds[0].fd & 1) {
++    if (!p->readers) ev |= POLLERR;
++    if (p->len < kPipeSize) ev |= POLLOUT;
++  } else {
++    if (p->len) ev |= POLLIN;
++    if (!p->writers) ev |= POLLHUP;
++  }
++  UNLOCK(&g_pipes.lock);
++  fds[0].revents = ev & (fds[0].events | POLLERR | POLLHUP);
++  return !!fds[0].revents;
++}
++
++static int TcgetattrPipe(int fd, struct termios *tio) {
++  return enotty();
++}
++
++static int TcsetattrPipe(int fd, int act, const struct termios *tio) {
++  return enotty();
++}
++
++static int TcgetwinsizePipe(int fd, struct winsize *ws) {
++  return enotty();
++}
++
++static int TcsetwinsizePipe(int fd, const struct winsize *ws) {
++  return enotty();
++}
++
++const struct FdCb kFdCbPipe = {
++    .close = ClosePipe,
++    .readv = ReadPipe,
++    .writev = WritePipe,
++    .poll = PollPipe,
++    .tcgetattr = TcgetattrPipe,
++    .tcsetattr = TcsetattrPipe,
++    .tcgetwinsize = TcgetwinsizePipe,
++    .tcsetwinsize = TcsetwinsizePipe,
++};
++
++static int ThreadedPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
++  int oflags, handles[2];
++  struct Fd *fd;
++  u8 fds_linux[2][4];
++  if (OpenPipe(handles) == -1) return -1;
++  oflags = (flags & O_CLOEXEC_LINUX ? O_CLOEXEC : 0) |
++           (flags & O_NDELAY_LINUX ? O_NDELAY : 0);
++  LOCK(&m->system->fds.lock);
++  unassert(fd = AddFd(&m->system->fds, handles[0], O_RDONLY | oflags));
++  fd->cb = &kFdCbPipe;
++  Write32(fds_linux[0], fd->fildes);
++  unassert(fd = AddFd(&m->system->fds, handles[1], O_WRONLY | oflags));
++  fd->cb = &kFdCbPipe;
++  Write32(fds_linux[1], fd->fildes);
++  UNLOCK(&m->system->fds.lock);
++  unassert(!CopyToUserWrite(m, pipefds_addr, fds_linux, sizeof(fds_linux)));
++  return 0;
++}
++#endif /* HAVE_THREADED_FORK */
++
+ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
+   int rc;
+   int lim;
+@@ -51,6 +258,9 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
+   if (!IsValidMemory(m, pipefds_addr, sizeof(fds_linux), PROT_WRITE)) {
+     return efault();
+   }
++#ifdef HAVE_THREADED_FORK
++  return ThreadedPipe2(m, pipefds_addr, flags);
++#endif
+   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+ #ifdef HAVE_PIPE2
+   if ((rc = VfsPipe2(fds, (oflags = XlatOpenFlags(flags)))) != -1) {
+diff --git a/blink/syscall.c b/blink/syscall.c
+index e965ef2..d715701 100644
+--- a/blink/syscall.c
++++ b/blink/syscall.c
+@@ -237,6 +237,13 @@ int GetHostFd(int fildes) {
+   UNLOCK(&g_machine->system->fds.lock);
+   return hostfd;
+ }
++
++static int DupHostFd(struct Fd *fd) {
++#ifdef HAVE_THREADED_FORK
++  if (IsPipe(fd->hostfd)) return DupPipe(fd->hostfd);
++#endif
++  return VfsDup(fd->hostfd);
++}
+ #endif
+ 
+ int GetDirFildes(int fildes) {
+@@ -549,12 +556,12 @@ static int CopyFds(struct Fds *dst, struct Fds *src) {
+   LOCK(&src->lock);
+   for (rc = 0, e = dll_first(src->list); e; e = dll_next(src->list, e)) {
+     fd = FD_CONTAINER(e);
+-    if ((hostfd = VfsDup(fd->hostfd)) == -1) {
++    if ((hostfd = DupHostFd(fd)) == -1) {
+       rc = -1;
+       break;
+     }
+     if (!(fd2 = ForkFd(dst, fd, hostfd, fd->oflags))) {
+-      VfsClose(hostfd);
++      fd->cb->close(hostfd);
+       rc = -1;
+       break;
+     }
+@@ -1445,7 +1452,7 @@ static int DupGuestFd(struct Machine *m, int fildes, int newfildes,
+     rc = -1;
+   } else if (newfildes == fildes) {
+     rc = fildes;
+-  } else if ((hostfd = VfsDup(fd->hostfd)) == -1) {
++  } else if ((hostfd = DupHostFd(fd)) == -1) {
+     rc = -1;
+   } else {
+     if (newfildes == -1) {
+@@ -1454,11 +1461,11 @@ static int DupGuestFd(struct Machine *m, int fildes, int newfildes,
+       dll_remove(&m->system->fds.list, &old->elem);
+     }
+     if (newfildes >= lim) {
+-      VfsClose(hostfd);
++      fd->cb->close(hostfd);
+       rc = emfile();
+     } else if (!(fd2 = ForkFd(&m->system->fds, fd, hostfd,
+                               (fd->oflags & ~O_CLOEXEC) | cloexec))) {
+-      VfsClose(hostfd);
++      fd->cb->close(hostfd);
+       rc = -1;
+     } else {
+       fd2->cb = fd->cb;
+@@ -2776,14 +2783,26 @@ static i64 SysPwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+   return SysPwritev2(m, fildes, iovaddr, iovlen, offset, 0);
+ }
+ 
++static const struct FdCb *GetFdCb(struct Machine *m, int fildes) {
++  struct Fd *fd;
++  const struct FdCb *cb = 0;
++  LOCK(&m->system->fds.lock);
++  if ((fd = GetFd(&m->system->fds, fildes))) cb = fd->cb;
++  UNLOCK(&m->system->fds.lock);
++  return cb;
++}
++
+ static i64 SysSendfile(struct Machine *m, i32 out_fd, i32 in_fd, i64 offsetaddr,
+                        u64 count) {
+   u64 toto, offset;
++  struct iovec iov;
+   ssize_t got, wrote;
+   u8 *buf, *offsetp = 0;
++  const struct FdCb *icb, *ocb;
+   size_t chunk, maxchunk = 16384;
+   if (CheckFdAccess(m, out_fd, true, EBADF) == -1) return -1;
+   if (CheckFdAccess(m, in_fd, false, EBADF) == -1) return -1;
++  if (!(icb = GetFdCb(m, in_fd)) || !(ocb = GetFdCb(m, out_fd))) return -1;
+   out_fd = GetHostFd(out_fd);
+   in_fd = GetHostFd(in_fd);
+   if (offsetaddr && !(offsetp = (u8 *)SchlepRW(m, offsetaddr, 8))) return -1;
+@@ -2801,13 +2820,17 @@ static i64 SysSendfile(struct Machine *m, i32 out_fd, i32 in_fd, i64 offsetaddr,
+     if (offsetp) {
+       got = VfsPread(in_fd, buf, chunk, offset + toto);
+     } else {
+-      got = VfsRead(in_fd, buf, chunk);
++      iov.iov_base = buf;
++      iov.iov_len = chunk;
++      got = icb->readv(in_fd, &iov, 1);
+     }
+     if (got == -1) goto OnFailure;
+     if (offsetp) Write64(offsetp, offset + toto + got);
+     if (got == 0) break;
+-    while (got > 0) {
+-      if ((wrote = VfsWrite(out_fd, buf, got)) == -1) goto OnFailure;
++    for (iov.iov_base = buf; got > 0;
++         iov.iov_base = (u8 *)iov.iov_base + wrote) {
++      iov.iov_len = got;
++      if ((wrote = ocb->writev(out_fd, &iov, 1)) == -1) goto OnFailure;
+       toto += wrote;
+       got -= wrote;
+     }
+@@ -2942,7 +2965,9 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
+   if (offset > NUMERIC_MAX(off_t)) return eoverflow();
+   if (offset < -NUMERIC_MAX(off_t) - 1) return eoverflow();
+   if (!(fd = GetAndLockFd(m, fildes))) return -1;
+-  if (!fd->dirstream) {
++  if (IsPipe(fd->hostfd)) {
++    rc = espipe();
++  } else if (!fd->dirstream) {
+     rc = VfsSeek(fd->hostfd, offset, XlatWhence(whence));
+   } else if (whence == SEEK_SET_LINUX) {
+     if (!offset) {
+@@ -3006,10 +3031,19 @@ static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
+ }
+ 
+ static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
+-  int rc;
++  int rc, hostfd;
+   struct stat st;
+   struct stat_linux gst;
+-  if ((rc = VfsFstat(GetHostFd(fd), &st)) != -1) {
++  hostfd = GetHostFd(fd);
++  if (IsPipe(hostfd)) {
++    memset(&st, 0, sizeof(st));
++    st.st_mode = S_IFIFO | 0600;
++    st.st_nlink = 1;
++    rc = 0;
++  } else {
++    rc = VfsFstat(hostfd, &st);
++  }
++  if (rc != -1) {
+     XlatStatToLinux(&gst, &st);
+     if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
+   }
+@@ -3453,7 +3487,8 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+     rc = UnXlatOpenFlags(fd->oflags);
+   } else if (cmd == F_SETFD_LINUX) {
+     if (!(arg & ~FD_CLOEXEC_LINUX)) {
+-      if (VfsFcntl(fd->hostfd, F_SETFD, arg ? FD_CLOEXEC : 0) != -1) {
++      if (IsPipe(fd->hostfd) ||
++          VfsFcntl(fd->hostfd, F_SETFD, arg ? FD_CLOEXEC : 0) != -1) {
+         fd->oflags &= ~O_CLOEXEC;
+         if (arg) fd->oflags |= O_CLOEXEC;
+         rc = 0;
+@@ -3466,7 +3501,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+   } else if (cmd == F_SETFL_LINUX) {
+     fl = XlatOpenFlags(arg & (O_APPEND_LINUX | O_ASYNC_LINUX | O_DIRECT_LINUX |
+                               O_NOATIME_LINUX | O_NDELAY_LINUX));
+-    if (VfsFcntl(fd->hostfd, F_SETFL, fl) != -1) {
++    if (IsPipe(fd->hostfd) || VfsFcntl(fd->hostfd, F_SETFL, fl) != -1) {
+       fd->oflags &= ~SETFL_FLAGS;
+       fd->oflags |= fl;
+       rc = 0;
+diff --git a/blink/syscall.h b/blink/syscall.h
+index b4f281f..146962b 100644
+--- a/blink/syscall.h
++++ b/blink/syscall.h
+@@ -73,6 +73,14 @@ int GetHostFd(int);
+ #else
+ #define GetHostFd(fildes) (fildes)
+ #endif
++#ifdef HAVE_THREADED_FORK
++#define kPipeHandle    0x40000000  // see pipe.c
++#define IsPipe(hostfd) ((hostfd) >= 0 && ((hostfd) & kPipeHandle))
++extern const struct FdCb kFdCbPipe;
++int DupPipe(int);
++#else
++#define IsPipe(hostfd) false
++#endif
+ void AddStdFd(struct Fds *, int);
+ int GetOflags(struct Machine *, int);
+ int GetFildes(struct Machine *, int);
+-- 
+2.53.0
+

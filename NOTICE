@@ -1,0 +1,9 @@
+blink-wfork
+Copyright 2026 Christopher Amiaud
+
+This kit modifies and redistributes blink (https://github.com/jart/blink), the
+x86-64 emulator of Justine Tunney, under the ISC license (see LICENSE). The
+patches in patches/, the scripts and the pages are under the same terms.
+
+Third-party components, their licenses, and how to get the sources of the
+guest system: THIRD_PARTY_NOTICES.md.

@@ -1,0 +1,169 @@
+From 559c8a3f1c3e4866e66388b8d3c7ce4c1da83fe3 Mon Sep 17 00:00:00 2001
+From: Christopher AMIAUD <christopher.amiaud@gmail.com>
+Date: Mon, 5 Oct 2026 10:59:07 +0200
+Subject: [PATCH 6/9] Publish /proc entries for threaded fork() on emscripten
+
+Emscripten builds have no procfs, so ps and top saw no processes. The
+table of processes now writes /proc/<pid>/{stat,status,comm,cmdline}
+to the filesystem when a process starts or runs a new program, and
+removes them when it exits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ blink/blink.c      |  1 +
+ blink/threadfork.c | 80 +++++++++++++++++++++++++++++++++++++++++++++-
+ blink/threadfork.h |  1 +
+ 3 files changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/blink/blink.c b/blink/blink.c
+index ea9ad3e..7a95021 100644
+--- a/blink/blink.c
++++ b/blink/blink.c
+@@ -234,6 +234,7 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
+     }
+     SetProcessMachine(m->system->pid, m);
+   }
++  NameProcess(m, argv && argv[0] ? argv[0] : prog);  // before argv is freed
+ #endif
+   if (!old) {
+     // this is the first time a program is being loaded
+diff --git a/blink/threadfork.c b/blink/threadfork.c
+index e283d17..7396a6a 100644
+--- a/blink/threadfork.c
++++ b/blink/threadfork.c
+@@ -18,9 +18,12 @@
+ ╚─────────────────────────────────────────────────────────────────────────────*/
+ #include "blink/threadfork.h"
+ 
++#include <fcntl.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+ 
+@@ -63,6 +66,7 @@ struct Proc {
+   bool zombie;   // exited, and waiting for wait4()
+   bool stopped;  // stopped, and waiting for SIGCONT
+   bool changed;  // stopped or continued since the last wait4()
++  char comm[16];
+   pthread_t thread;
+   struct Machine *m;  // changes on execve()
+ };
+@@ -87,6 +91,73 @@ static struct Proc *FindProc(int pid) {
+   return p;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// Emscripten builds have no procfs, so /proc/<pid> is written to the
++// filesystem as processes come and go, for programs like ps and top.
++
++static void WriteProcFile(int pid, const char *name, const char *data) {
++  int fd;
++  char path[64];
++  snprintf(path, sizeof(path), "/proc/%d/%s", pid, name);
++  if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644)) != -1) {
++    write(fd, data, strlen(data));
++    close(fd);
++  }
++}
++
++static void PublishProc(int pid, int ppid, int pgid, const char *comm) {
++  char buf[256];
++  mkdir("/proc", 0755);
++  snprintf(buf, sizeof(buf), "/proc/%d", pid);
++  mkdir(buf, 0755);
++  snprintf(buf, sizeof(buf), "%s\n", comm);
++  WriteProcFile(pid, "comm", buf);
++  WriteProcFile(pid, "cmdline", comm);
++  snprintf(buf, sizeof(buf),
++           "%d (%s) S %d %d %d 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 "
++           "0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
++           pid, comm, ppid, pgid, pgid);
++  WriteProcFile(pid, "stat", buf);
++  snprintf(buf, sizeof(buf),
++           "Name:\t%s\nState:\tS (sleeping)\nPid:\t%d\nPPid:\t%d\n", comm, pid,
++           ppid);
++  WriteProcFile(pid, "status", buf);
++}
++
++static void UnpublishProc(int pid) {
++  int i;
++  char path[64];
++  const char *const kFiles[] = {"comm", "cmdline", "stat", "status"};
++  for (i = 0; i < ARRAYLEN(kFiles); ++i) {
++    snprintf(path, sizeof(path), "/proc/%d/%s", pid, kFiles[i]);
++    unlink(path);
++  }
++  snprintf(path, sizeof(path), "/proc/%d", pid);
++  rmdir(path);
++}
++#else
++#define PublishProc(pid, ppid, pgid, comm) (void)0
++#define UnpublishProc(pid)                 (void)0
++#endif
++
++// tells ps and top the program which process `m` belongs to now runs
++void NameProcess(struct Machine *m, const char *path) {
++  struct Proc *p;
++  const char *name;
++  int pid, ppid = 0, pgid = 0;
++  char comm[sizeof(p->comm)];
++  name = (name = strrchr(path, '/')) ? name + 1 : path;
++  snprintf(comm, sizeof(comm), "%s", name);
++  LOCK(&g_procs.lock);
++  if ((p = FindProc((pid = m->system->pid)))) {
++    memcpy(p->comm, comm, sizeof(comm));
++    ppid = p->ppid;
++    pgid = p->pgid;
++  }
++  UNLOCK(&g_procs.lock);
++  PublishProc(pid, ppid, pgid, comm);
++}
++
+ static int GetPgid(int pid) {
+   struct Proc *p;
+   return (p = FindProc(pid)) ? p->pgid : pid;
+@@ -133,10 +204,16 @@ int AddChildProcess(struct System *s, int ppid) {
+   LOCK(&g_procs.lock);
+   p->pid = s->pid = ++g_procs.lastpid;
+   p->ppid = ppid;
+-  p->pgid = (parent = FindProc(ppid)) ? parent->pgid : p->pid;
++  if ((parent = FindProc(ppid))) {
++    p->pgid = parent->pgid;
++    memcpy(p->comm, parent->comm, sizeof(p->comm));
++  } else {
++    p->pgid = p->pid;
++  }
+   p->next = g_procs.list;
+   g_procs.list = p;
+   UNLOCK(&g_procs.lock);
++  PublishProc(p->pid, p->ppid, p->pgid, p->comm);
+   return p->pid;
+ }
+ 
+@@ -193,6 +270,7 @@ _Noreturn void ExitChildProcess(struct Machine *m, int wstatus) {
+     FreeFd(fd);
+   }
+   UNLOCK(&m->system->fds.lock);
++  UnpublishProc(m->system->pid);
+   LOCK(&g_procs.lock);
+   if ((p = FindProc(m->system->pid))) {
+     p->m = m;
+diff --git a/blink/threadfork.h b/blink/threadfork.h
+index 07b3ceb..e38190c 100644
+--- a/blink/threadfork.h
++++ b/blink/threadfork.h
+@@ -9,6 +9,7 @@ void AddMainProcess(struct Machine *);
+ int AddChildProcess(struct System *, int);
+ void RemoveChildProcess(int);
+ void SetProcessMachine(int, struct Machine *);
++void NameProcess(struct Machine *, const char *);
+ void SetChildThread(int, pthread_t);
+ _Noreturn void ExitChildProcess(struct Machine *, int);
+ void StopProcess(struct Machine *, int);
+-- 
+2.53.0
+

@@ -1,0 +1,647 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>shell.blop.foo — real bash, emulated x86-64, in a CRT</title>
+<meta name="description" content="A real x86-64 bash, emulated in your browser (WebAssembly) by a fork of jart/blink that adds fork(), pipes and job control, in a CRT terminal.">
+<meta name="theme-color" content="#05070a">
+<link rel="icon" id="favicon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23070a0f'/%3E%3Ctext x='9' y='44' font-family='monospace' font-size='30' fill='%235fd7e5'%3E%26gt;_%3C/text%3E%3C/svg%3E">
+<!-- COI service worker FIRST: it installs COOP/COEP so SharedArrayBuffer (the
+     fork-enabled threads build) works on any static host, no server headers. -->
+<script src="coi-serviceworker.js"></script>
+<!-- terminal frontend: ghostty-web (WASM port of Ghostty's VT), imported as an ES
+     module below. Renders to a <canvas>, no stylesheet needed. xterm.js fallback
+     lives at /index-xterm.html. -->
+<style>
+  :root{ --phosphor:#39ffae; --tab-fg:#7c8a82; --chin:64px; }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:radial-gradient(130% 120% at 50% 12%, #0c1119 0%, #06080d 58%, #020305 100%);
+    overflow:hidden;
+    font-family:'JetBrains Mono','Fira Code',ui-monospace,Menlo,Consolas,monospace;
+    color:#5b6675;
+  }
+  .room{position:fixed;inset:0;display:grid;place-items:center;padding:clamp(6px,2.2vmin,40px)}
+
+  /* ---- the drawn monitor: graphite plastic, beveled, recessed glass ---- */
+  .monitor{position:relative;width:100%;height:100%;max-width:1600px}
+  .bezel{
+    position:relative;width:100%;height:100%;
+    border-radius:clamp(16px,2.4vmin,30px);
+    padding:clamp(12px,2.2vmin,28px);
+    padding-bottom:var(--chin);
+    background:linear-gradient(157deg,#2c313a 0%,#202530 55%,#13161d 100%);
+    box-shadow:
+      inset 0 2px 0 rgba(255,255,255,.07),
+      inset 0 -4px 10px rgba(0,0,0,.65),
+      inset 0 0 0 1px rgba(0,0,0,.45),
+      0 36px 70px -22px rgba(0,0,0,.85),
+      0 0 0 1px rgba(0,0,0,.5);
+  }
+  /* recessed screen: deep inner shadow = the glass sits inside the case */
+  .screen{
+    position:relative;width:100%;height:100%;
+    display:flex;flex-direction:column;
+    border-radius:clamp(8px,1.4vmin,16px);
+    overflow:hidden;background:#04070a;
+    box-shadow:
+      inset 0 0 0 2px rgba(0,0,0,.85),
+      inset 0 0 70px 14px rgba(0,0,0,.92),
+      inset 0 0 140px 36px rgba(20,60,40,.10);
+  }
+
+  /* ---- tab strip (sits inside the glass, under the CRT layers) ---- */
+  .tabbar{
+    flex:0 0 auto;display:flex;align-items:stretch;gap:3px;
+    height:32px;padding:5px 7px 0;
+    background:linear-gradient(#0a1410,#060c0a);
+    font:600 11px/1 ui-monospace,monospace;
+    z-index:3;
+  }
+  .tab{
+    display:flex;align-items:center;gap:7px;max-width:180px;padding:0 9px;
+    border-radius:8px 8px 0 0;cursor:pointer;white-space:nowrap;color:var(--tab-fg);
+    background:rgba(255,255,255,.03);user-select:none;transition:color .12s,background .12s;
+  }
+  .tab:hover{color:#aebbb2}
+  .tab.active{background:#05080a;color:var(--phosphor);text-shadow:0 0 5px rgba(57,255,174,.5)}
+  .tab .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto;opacity:.8}
+  .tab .lbl{overflow:hidden;text-overflow:ellipsis}
+  .tab .x{margin-left:2px;opacity:.45;font-weight:700;padding:0 2px;border-radius:4px}
+  .tab .x:hover{opacity:1;color:#ff8a8a;background:rgba(255,138,138,.12)}
+  .newtab{
+    align-self:center;width:23px;height:23px;margin-left:3px;border-radius:7px;
+    display:grid;place-items:center;cursor:pointer;color:var(--tab-fg);
+    background:rgba(255,255,255,.04);font-size:16px;font-weight:700;line-height:0;
+    transition:color .12s,background .12s;
+  }
+  .newtab:hover{color:var(--phosphor);background:rgba(57,255,174,.10)}
+
+  /* ---- terminal stack (ghostty-web renders to a <canvas>; it draws its own
+     scrollbar, so no scrollbar CSS needed) ---- */
+  .terms{position:relative;flex:1;min-height:0}
+  .termwrap{position:absolute;inset:0;padding:12px 8px 8px 12px}
+  .termwrap canvas{display:block}
+  /* CRT tint + a soft phosphor bloom over the canvas (per-glyph colour glow isn't
+     achievable on a canvas the way it was with xterm's DOM rows) */
+  .termwrap{ filter:contrast(1.07) brightness(1.05) saturate(1.12) drop-shadow(0 0 1px rgba(130,255,190,.35)); }
+
+  /* ---- CRT layers (all non-interactive, above everything in the glass) ---- */
+  .crt{position:absolute;inset:0;pointer-events:none;z-index:5}
+  .crt-scanlines{
+    background:repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0, rgba(0,0,0,0) 2px, rgba(0,0,0,.26) 3px, rgba(0,0,0,.26) 3px);
+    background-size:100% 3px; mix-blend-mode:multiply;
+  }
+  .crt-mask{
+    background:repeating-linear-gradient(to right,
+      rgba(255,0,0,.04), rgba(0,255,0,.03) 1px, rgba(0,0,255,.04) 2px, transparent 3px);
+    mix-blend-mode:screen; opacity:.6;
+  }
+  .crt-vignette{ background:radial-gradient(125% 125% at 50% 50%, transparent 52%, rgba(0,0,0,.62) 100%); }
+  .crt-glare{ background:linear-gradient(128deg, rgba(255,255,255,.07) 0%, transparent 38%); }
+  .crt-sweep{
+    background:linear-gradient(to bottom, transparent, rgba(180,255,220,.05) 50%, transparent);
+    height:38%; top:-38%; animation:sweep 7.5s linear infinite;
+  }
+  .crt-flicker{ background:rgba(120,255,180,.018); animation:flicker 7s steps(2,end) infinite; }
+  @keyframes sweep{ to{ transform:translateY(380%);} }
+  @keyframes flicker{
+    0%,100%{opacity:.20} 8%{opacity:.55} 9%{opacity:.20}
+    40%{opacity:.22} 41%{opacity:.62} 42%{opacity:.20} 74%{opacity:.30}
+  }
+  .poweron{position:absolute;inset:0;background:#dffbe9;pointer-events:none;z-index:6;
+    animation:poweron 850ms ease-out forwards}
+  @keyframes poweron{
+    0%{opacity:1; clip-path:inset(49.7% 0 49.7% 0)}
+    30%{opacity:1; clip-path:inset(0 0 0 0)}
+    55%{opacity:.35}
+    100%{opacity:0}
+  }
+
+  /* ---- bezel chin: brand + power LED ---- */
+  .brand{
+    position:absolute;left:0;right:0;bottom:0;height:var(--chin);
+    display:flex;align-items:center;justify-content:center;gap:10px;
+    font:600 11px/1 ui-monospace,monospace;letter-spacing:.22em;text-transform:uppercase;
+    color:#4d5765;user-select:none;
+  }
+  .brand b{color:#7f8b9a;font-weight:700}
+  .brand .srclink{color:inherit;text-decoration:none;user-select:auto}
+  .brand .srclink:hover{color:#7f8b9a}
+  .led{width:9px;height:9px;border-radius:50%;background:var(--phosphor);
+    box-shadow:0 0 9px 2px rgba(57,255,174,.7), inset 0 0 2px rgba(0,0,0,.4);
+    animation:pulse 3.4s ease-in-out infinite}
+  @keyframes pulse{50%{box-shadow:0 0 5px 1px rgba(57,255,174,.45)}}
+
+  @media (prefers-reduced-motion: reduce){
+    .crt-sweep,.crt-flicker,.led,.poweron{animation:none}
+    .poweron{display:none}
+  }
+</style>
+</head>
+<body>
+  <div class="room">
+    <div class="monitor">
+      <div class="bezel">
+        <div class="screen">
+          <div class="tabbar" id="tabbar">
+            <div class="newtab" id="newtab" title="new shell">+</div>
+          </div>
+          <div class="terms" id="terms"></div>
+          <div class="crt crt-mask"></div>
+          <div class="crt crt-scanlines"></div>
+          <div class="crt crt-sweep"></div>
+          <div class="crt crt-vignette"></div>
+          <div class="crt crt-glare"></div>
+          <div class="crt crt-flicker"></div>
+          <div class="poweron"></div>
+        </div>
+        <div class="brand"><span class="led"></span> blop <b>CRT&middot;9000</b> &mdash; x86-64 &middot; <a class="srclink" href="SOURCES.txt" target="_blank" rel="noopener" title="sources of the free software (GPL)">sources</a></div>
+      </div>
+    </div>
+  </div>
+
+<script type="module">
+import { init, Terminal } from "./ghostty-web.js?v=native3";
+const Q    = new URLSearchParams(location.search);
+const CMD0 = (Q.get("cmd") || "bash").toLowerCase();         // command for the first tab
+const ACC  = "#" + (Q.get("accent") || "39ffae").replace(/[^0-9a-fA-F]/g,"").slice(0,6).padEnd(6,"f");
+const FONT = 14;
+const FONTFAM = "'JetBrains Mono','Fira Code',ui-monospace,Menlo,Consolas,monospace";
+// Cap the terminal render resolution. ghostty repaints the whole canvas every frame
+// at devicePixelRatio; on HiDPI (1.5/2×) that's a heavy per-frame cost on the main
+// thread that starves blink's proxied TTY syscalls → keystroke lag. 1 = sharpest
+// speed win (slightly softer text on HiDPI); bump toward window.devicePixelRatio for
+// crisper text at higher cost.
+const DPR_CAP = 1;
+// bump on every artefact change → cache-busts rootfs.tar + blink.threads.{js,wasm}
+// (darkhttpd ignores the query; the browser keys its cache on the full URL).
+const ASSET_V = "20261005e";
+
+// Green-leaning phosphor palette that still renders ANSI colours truthfully.
+const theme = {
+  background:"#05080a", foreground:"#cfe8d8", cursor:ACC,
+  selectionBackground:"rgba(57,255,174,.25)",
+  black:"#1d2630", red:"#ff6b6b", green:"#9ece6a", yellow:"#e0af68",
+  blue:"#7aa2f7", magenta:"#bb9af7", cyan:"#7dcfff", white:"#cfe8d8",
+  brightBlack:"#566173", brightRed:"#ff8a8a", brightGreen:"#b9f27c",
+  brightYellow:"#f0c987", brightBlue:"#9ab8ff", brightMagenta:"#d2b8ff",
+  brightCyan:"#a4e4ff", brightWhite:"#eafff4",
+};
+
+// ---- shared, lazily-loaded resources ----
+let _blinkScript = null, _rootfs = null;
+const coiOk = self.crossOriginIsolated;
+function loadBlink(){
+  if (!_blinkScript) _blinkScript = new Promise((res,rej)=>{
+    const s=document.createElement("script");
+    s.src="blink.threads.js?v="+ASSET_V; s.onload=res; s.onerror=()=>rej(new Error("blink.threads.js"));
+    document.head.appendChild(s);                       // defines createBlink() once, reused per tab
+  });
+  return _blinkScript;
+}
+// stream the rootfs so we can report download progress (it's the big first-load
+// cost). Memoised: only the first tab actually downloads; later tabs reuse it.
+async function getRootfs(onProgress){
+  if (_rootfs){ onProgress && onProgress(_rootfs.length, _rootfs.length); return _rootfs; }
+  const resp = await fetch("rootfs.tar?v="+ASSET_V);
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  const total = +(resp.headers.get("content-length") || 0);
+  if (!resp.body || !total){                         // no streaming/length → one shot
+    _rootfs = new Uint8Array(await resp.arrayBuffer());
+    onProgress && onProgress(_rootfs.length, _rootfs.length);
+    return _rootfs;
+  }
+  const reader = resp.body.getReader();
+  const chunks = []; let got = 0;
+  for(;;){
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    onProgress && onProgress(got, total);
+  }
+  const out = new Uint8Array(got); let off = 0;
+  for (const c of chunks){ out.set(c, off); off += c.length; }
+  _rootfs = out;
+  return _rootfs;
+}
+
+// ---- boot status line, written into the terminal before bash starts ----
+const _mb = n => (n / 1048576).toFixed(1);
+function _bar(frac, w){
+  const n = Math.max(0, Math.min(w, Math.round(frac * w)));
+  return "█".repeat(n) + "░".repeat(w - n);
+}
+// Boot progress is surfaced in the page <title> + favicon, NOT printed into the
+// terminal — keeps the CRT viewport clean (no leftover "downloading rootfs" lines).
+const BASE_TITLE = document.title;
+const _FAV = c =>
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E" +
+  "%3Crect width='64' height='64' rx='14' fill='%23070a0f'/%3E" +
+  "%3Ctext x='9' y='44' font-family='monospace' font-size='30' fill='" + c + "'%3E%26gt;_%3C/text%3E%3C/svg%3E";
+function _setFav(href){ const l = document.getElementById("favicon"); if (l) l.href = href; }
+function bootStatus(term, msg){
+  if (msg){
+    document.title = "⟳ " + msg + " — shell.blop.foo";
+    _setFav(_FAV("%23e5c15f"));   // amber while loading
+  } else {
+    document.title = BASE_TITLE;
+    _setFav(_FAV("%235fd7e5"));   // back to cyan prompt
+  }
+}
+
+// minimal tar extractor into the emscripten FS (recreates busybox symlinks).
+function untar(buf, FS){
+  let off=0;
+  const str=(s,len)=>{let r="";for(let i=s;i<s+len;i++){if(buf[i]===0)break;r+=String.fromCharCode(buf[i]);}return r;};
+  const dirOf=p=>{const i=p.lastIndexOf("/");return i<=0?"/":p.slice(0,i);};
+  while(off+512<=buf.length){
+    const name=str(off,100); if(!name){off+=512;continue;}
+    const mode=parseInt(str(off+100,8).trim(),8)||0o644;
+    const size=parseInt(str(off+124,12).trim(),8)||0;
+    const type=String.fromCharCode(buf[off+156]||48);
+    const link=str(off+157,100); const prefix=str(off+345,155);
+    let path=(prefix?prefix+"/":"")+name; path="/"+path.replace(/^\.?\/+/,"").replace(/\/+$/,""); off+=512;
+    try{
+      if(type==="5"){try{FS.mkdirTree(path);}catch(e){}}
+      else if(type==="2"){try{FS.mkdirTree(dirOf(path));}catch(e){}try{FS.unlink(path);}catch(e){}try{FS.symlink(link,path);}catch(e){}}
+      else if(type==="0"||type===" "||type==="7"){try{FS.mkdirTree(dirOf(path));}catch(e){}FS.writeFile(path,buf.subarray(off,off+size));try{FS.chmod(path,mode);}catch(e){}}
+    }catch(e){}
+    off+=Math.ceil(size/512)*512;
+  }
+}
+
+// async, chunked tar extractor: same as untar() but yields to the event loop every
+// CHUNK entries so the render loop stays alive (no main-thread freeze on big rootfs
+// / on a 2nd tab where the download is cached) and we can report extraction %.
+async function untarAsync(buf, FS, onProgress){
+  let off=0, n=0;
+  const CHUNK=48;
+  const str=(s,len)=>{let r="";for(let i=s;i<s+len;i++){if(buf[i]===0)break;r+=String.fromCharCode(buf[i]);}return r;};
+  const dirOf=p=>{const i=p.lastIndexOf("/");return i<=0?"/":p.slice(0,i);};
+  while(off+512<=buf.length){
+    const name=str(off,100); if(!name){off+=512;continue;}
+    const mode=parseInt(str(off+100,8).trim(),8)||0o644;
+    const size=parseInt(str(off+124,12).trim(),8)||0;
+    const type=String.fromCharCode(buf[off+156]||48);
+    const link=str(off+157,100); const prefix=str(off+345,155);
+    let path=(prefix?prefix+"/":"")+name; path="/"+path.replace(/^\.?\/+/,"").replace(/\/+$/,""); off+=512;
+    try{
+      if(type==="5"){try{FS.mkdirTree(path);}catch(e){}}
+      else if(type==="2"){try{FS.mkdirTree(dirOf(path));}catch(e){}try{FS.unlink(path);}catch(e){}try{FS.symlink(link,path);}catch(e){}}
+      else if(type==="0"||type===" "||type==="7"){try{FS.mkdirTree(dirOf(path));}catch(e){}FS.writeFile(path,buf.subarray(off,off+size));try{FS.chmod(path,mode);}catch(e){}}
+    }catch(e){}
+    off+=Math.ceil(size/512)*512;
+    if(++n % CHUNK === 0){
+      onProgress && onProgress(off/buf.length);
+      await new Promise(r=>setTimeout(r,0));   // yield → render loop paints, no freeze
+    }
+  }
+  onProgress && onProgress(1);
+}
+
+// busybox applets -> symlinks so `ls`, `cat`, `grep`… resolve to real binaries
+const APPLETS = ("ls ll cat grep sed head tail wc sort uniq echo pwd cut tr od xxd find sleep " +
+  "env whoami id uname hostname date dirname basename mkdir rmdir touch rm cp mv ln chmod chown " +
+  "true false yes seq printf clear tee less more vi awk ps top kill du df stat readlink realpath " +
+  "wget tar gzip gunzip md5sum sha256sum base64 nl tac rev fold xargs which mktemp").split(" ");
+function installApplets(FS){ for (const a of APPLETS){ try{ FS.symlink("/bin/busybox", "/bin/"+a); }catch(e){} } }
+
+// static, machine-level /proc nodes so `cat /proc/cpuinfo`, `uptime`, `free` and
+// `top` (which reads /proc/stat + /proc/meminfo) work. The per-process /proc/<pid>
+// entries are materialised by the blink fork itself, so `ps`/`top` list real procs.
+function writeProcStatic(FS){
+  const W = (p, s) => { try { FS.writeFile(p, s); } catch(e){} };
+  try { FS.mkdirTree("/proc"); } catch(e){}
+  W("/proc/cpuinfo",
+    "processor\t: 0\nvendor_id\t: BlinkGenuine\ncpu family\t: 6\n" +
+    "model name\t: blink x86-64 emulator (WASM)\ncpu MHz\t\t: 1000.000\n" +
+    "cache size\t: 0 KB\nflags\t\t: fpu sse sse2 lm\nbogomips\t: 2000.00\n\n");
+  W("/proc/meminfo",
+    "MemTotal:        262144 kB\nMemFree:         131072 kB\nMemAvailable:    196608 kB\n" +
+    "Buffers:              0 kB\nCached:               0 kB\nSwapTotal:            0 kB\nSwapFree:             0 kB\n");
+  W("/proc/stat",
+    "cpu  0 0 0 1000 0 0 0 0 0 0\ncpu0 0 0 0 1000 0 0 0 0 0 0\n" +
+    "intr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n");
+  W("/proc/uptime", "1000.00 1000.00\n");
+  W("/proc/loadavg", "0.00 0.00 0.00 1/1 1\n");
+  W("/proc/version",
+    "Linux version 4.5.0-blink-wfork (blop) #1 SMP x86-64 emulated in WASM\n");
+  W("/proc/filesystems", "nodev\tproc\n\text4\n");
+}
+
+const E = "\x1b";
+// Job control now works (no "cannot set terminal process group" warnings), so we drop
+// the old one-shot PROMPT_COMMAND clear hack and print a neofetch-style MOTD directly.
+// Palette + Alpine-mountain logo (the rootfs IS Alpine). Built with `printf '%s\n'` on
+// double-quoted args: ESC bytes are embedded from JS, the logo uses Unicode box glyphs
+// (╱ ╲ — no backslashes to escape), and ${…} fields expand. Works in bash AND ash.
+const A  = E + "[36m";   // accent: bright cyan (the mountain)
+const A2 = E + "[34m";   // accent 2: deeper blue (snow base)
+const G  = E + "[1;32m";   // green: field keys
+const W  = E + "[39m";  // bright white: field values
+const D  = E + "[2m";         // dim
+const B  = E + "[1m";         // bold
+const R  = E + "[0m";         // reset
+const BANNER_RC =
+  // start in $HOME, like a login shell (blink starts in /), where hi.c is
+  'cd\n' +
+  // --- prompt (bash needs \[ \] non-printing guards; ash takes raw escapes) ---
+  'if [ -n "$BASH_VERSION" ]; then\n' +
+  "  PS1='\\[\\e[1;32m\\]blop\\[\\e[0m\\] \\[\\e[1;34m\\]\\w\\[\\e[0m\\] \\[\\e[1m\\]\\$\\[\\e[0m\\] '\n" +
+  'else\n' +
+  "  PS1='" + E + "[1;32mblop" + E + "[0m " + E + "[1;34m\\w" + E + "[0m " + E + "[1m\\$" + E + "[0m '\n" +
+  'fi\n' +
+  // --- gather a few real facts (no extra subshells: globs + read builtins) ---
+  'V=${BASH_VERSION%%(*}; SH="BusyBox ash"; [ -n "$V" ] && SH="GNU bash $V"\n' +
+  'OSV=""; read OSV < /etc/alpine-release 2>/dev/null; OS="Alpine Linux"; [ -n "$OSV" ] && OS="Alpine Linux $OSV"\n' +
+  'set -- /bin/*; PKGS=$#\n' +
+  // --- clear, then the banner: Alpine mountain (left) + neofetch fields (right) ---
+  "printf '" + E + "[2J" + E + "[H'\n" +
+  'printf "%s\\n" \\\n' +
+  '"" \\\n' +
+  '"  ' + A + '      ╱╲        ' + R + B + 'blop' + R + D + '@' + R + B + 'blink' + R + '   ' + D + 'real x86-64, in your browser' + R + '" \\\n' +
+  '"  ' + A + '     ╱  ╲       ' + R + D + '──────────────────────────────────────' + R + '" \\\n' +
+  '"  ' + A + '    ╱ ╱╲ ╲      ' + R + G + 'os      ' + R + W + '$OS  ·  x86-64' + R + '" \\\n' +
+  '"  ' + A + '   ╱ ╱  ╲ ╲     ' + R + G + 'kernel  ' + R + W + '4.5.0-blink-wfork (WASM)' + R + '" \\\n' +
+  '"  ' + A + '  ╱ ╱ ╱╲ ╲ ╲    ' + R + G + 'shell   ' + R + W + '$SH' + R + '" \\\n' +
+  '"  ' + A2 + ' ╱_╱_╱  ╲_╲_╲   ' + R + G + 'engine  ' + R + W + 'jart/blink + wfork — fork(), pipes, ps' + R + '" \\\n' +
+  '"                  ' + G + 'term    ' + R + W + 'ghostty-web (canvas VT)' + R + '" \\\n' +
+  '"                  ' + G + 'cpu     ' + R + W + 'x86-64, pure interpretation (no JIT)' + R + '" \\\n' +
+  '"                  ' + G + 'pkgs    ' + R + W + "$PKGS applets in /bin" + R + '" \\\n' +
+  '"" \\\n' +
+  '"                  ' + E + '[38;5;203m███' + E + '[38;5;215m███' + E + '[38;5;227m███' + E + '[38;5;48m███' + E + '[38;5;45m███' + E + '[38;5;39m███' + E + '[38;5;141m███' + R + '" \\\n' +
+  '"" \\\n' +
+  '"  ' + D + 'try' + R + '  ' + W + 'ls -la /' + R + '   ' + W + 'ps' + R + '   ' + W + 'echo hi | sort' + R + '   ' + W + 'top' + R + '   ' + W + 'vi' + R + '   ' + W + 'tcc -run hi.c' + R + '" \\\n' +
+  '""\n';
+
+// the C file the banner suggests: `tcc -run hi.c`
+const HI_C = '#include <stdio.h>\nint main(void) { puts("hello from tcc, in your browser"); return 0; }\n';
+
+// ---- resolution-aware fit. We DON'T use ghostty's FitAddon (it mis-sized the
+// grid in our layout → column desync / overflow). Instead we measure the cell the
+// exact same way ghostty does internally — ceil(measureText("M").width) at the same
+// font, in CSS px — and resize the terminal ourselves. cols/rows then match what
+// ghostty actually renders, so the guest's TIOCGWINSZ agrees with the canvas.
+let _cellW = 0, _cellH = 0;
+function measureCell(){
+  if (_cellW) return;
+  const cnv = document.createElement("canvas");
+  const x = cnv.getContext("2d");
+  x.font = FONT + "px " + FONTFAM;
+  const m = x.measureText("M");
+  _cellW = Math.ceil(m.width) || Math.ceil(FONT * 0.6);
+  const asc = m.actualBoundingBoxAscent  || FONT * 0.8;
+  const desc = m.actualBoundingBoxDescent || FONT * 0.2;
+  _cellH = Math.ceil(asc + desc) + 2;                 // matches ghostty's measureFont()
+}
+function fit(t){
+  if (!t) return;
+  measureCell();
+  // .termwrap padding is 12 8 8 12; reserve ~14px for ghostty's own scrollbar.
+  const w = t.wrap.clientWidth  - 12 - 8 - 14;
+  const h = t.wrap.clientHeight - 12 - 8;
+  if (w <= 0 || h <= 0) return;
+  const cols = Math.max(20, Math.floor(w / _cellW));
+  const rows = Math.max(6,  Math.floor(h / _cellH));
+  try { t.term.resize(cols, rows); } catch(e){}
+}
+// Pause the render loop of tabs that aren't visible: ghostty RAF-renders the whole
+// canvas every frame for EVERY open terminal (even hidden ones), each one taxing the
+// main thread. Only the active tab needs to paint. Safe no-op if the build doesn't
+// expose startRenderLoop (we'd never be able to resume, so we just don't pause).
+function canPause(t){ return t.term && typeof t.term.startRenderLoop === "function"; }
+function pauseRender(t){ if (!canPause(t) || t.paused) return; t.paused = true; try { cancelAnimationFrame(t.term.animationFrameId); } catch(e){} }
+function resumeRender(t){ if (!t || !t.paused) return; t.paused = false; try { t.term.startRenderLoop(); } catch(e){} }
+// ghostty renders the first screen before the CRT/flex layout has fully settled,
+// then doesn't redraw existing content until something resizes it (the user saw a
+// glyph dropped at the wrap edge until a manual window resize fixed it). resync()
+// re-fits to the settled size AND nudges the grid by one row to force a full
+// re-render from ghostty's buffer — i.e. it reproduces that manual resize.
+function resync(t){
+  if (!t || !t.term) return;
+  fit(t);
+  try {
+    const c = t.term.cols, r = t.term.rows;
+    t.term.resize(c, Math.max(2, r - 1));
+    t.term.resize(c, r);
+  } catch(e){}
+}
+
+// ---- tabs ----
+const tabbar  = document.getElementById("tabbar");
+const newtab  = document.getElementById("newtab");
+const termsEl = document.getElementById("terms");
+const tabs = [];
+let activeTab = null, counter = 0;
+
+function feed(buf, s){ for (let i=0;i<s.length;i++) buf.push(s.charCodeAt(i) & 0xff); }
+const utf8 = new TextEncoder();   // keystrokes and pastes are JS strings; the guest reads UTF-8 bytes
+window.__feed = s => activeTab && feed(activeTab.stdinBuffer, s);   // handy for scripted testing
+window.__tab = () => activeTab;   // its term and blink instance, for scripted tests too
+
+function activate(t){
+  activeTab = t;
+  for (const x of tabs){
+    const on = x===t;
+    x.wrap.style.display = on ? "block" : "none";
+    x.btn.classList.toggle("active", on);
+    if (!on) pauseRender(x);            // only the visible tab keeps rendering
+  }
+  if (t) requestAnimationFrame(()=>{ resumeRender(t); resync(t); t.term.focus(); });
+}
+
+function closeTab(t){
+  const i = tabs.indexOf(t); if (i<0) return;
+  try{ feed(t.stdinBuffer, "exit\n"); }catch(e){}                  // let bash exit -> runtime + workers tear down
+  setTimeout(()=>{ try{ t.term.dispose(); }catch(e){} }, 200);
+  t.wrap.remove(); t.btn.remove();
+  tabs.splice(i,1);
+  if (activeTab===t) activate(tabs[Math.min(i, tabs.length-1)] || null);
+}
+
+function newTab(cmd){
+  counter++;
+  const id = counter;
+  const wrap = document.createElement("div"); wrap.className = "termwrap"; termsEl.appendChild(wrap);
+  const term = new Terminal({ convertEol:false, fontSize:FONT, cursorBlink:true, fontFamily:FONTFAM, scrollback:5000, theme });
+  term.open(wrap);
+  try { term.renderer.devicePixelRatio = Math.min(window.devicePixelRatio||1, DPR_CAP); } catch(e){}  // cap render res (see DPR_CAP)
+  const stdinBuffer = [];
+  // Forward keystrokes raw (ESC, CSI arrows, Tab). Echo is done the real Unix way
+  // (termios ECHO) by the kernel/programs — no JS-side echo. EXCEPTION: job control.
+  // The line discipline that turns ^C/^Z/^\ into signals lives in blink, but the
+  // keystrokes arrive here on the main thread, so we drive it: when the controlling
+  // tty has ISIG set (cooked mode — a foreground command is running, not raw-mode
+  // readline at the prompt), map those control chars to a signal sent to the
+  // foreground process group instead of feeding them as bytes.
+  term.onData(raw => {
+    for (const b of utf8.encode(raw)){
+      const inst = t.inst;
+      if (inst && inst._blink_tty_isig && inst._blink_tty_isig()){
+        if (b===3 ){ inst._blink_tty_signal(2);  continue; }  // ^C  -> SIGINT
+        if (b===26){ inst._blink_tty_signal(20); continue; }  // ^Z  -> SIGTSTP
+        if (b===28){ inst._blink_tty_signal(3);  continue; }  // ^\  -> SIGQUIT
+      }
+      stdinBuffer.push(b);
+    }
+  });
+
+  const btn = document.createElement("div"); btn.className = "tab";
+  btn.innerHTML = '<span class="dot"></span><span class="lbl"></span><span class="x" title="close">&times;</span>';
+  btn.querySelector(".lbl").textContent = (cmd==="busybox"?"sh":"shell") + " " + id;
+  const t = { id, term, wrap, btn, stdinBuffer, inst:null };
+  btn.addEventListener("click", e => {
+    if (e.target.classList.contains("x")) closeTab(t);
+    else activate(t);
+  });
+  tabbar.insertBefore(btn, newtab);
+  tabs.push(t);
+  activate(t);
+  bootTab(t, cmd);
+  return t;
+}
+
+async function bootTab(t, cmd){
+  const term = t.term, stdinBuffer = t.stdinBuffer;
+  const err = m => term.write("\r\n\x1b[38;5;210m"+m+"\x1b[0m\r\n");
+  if (!coiOk){
+    err("no cross-origin isolation: fork() runs on threads, which need SharedArrayBuffer.");
+    err("reload the page once (the COI service worker adds the headers on the first load).");
+    return;
+  }
+  let tar;
+  try {
+    tar = await getRootfs((got, total) => {
+      const f = total ? got / total : 0;
+      const bw = Math.max(6, Math.min(22, (term.cols || 80) - 26));   // fit narrow panes (IDE)
+      bootStatus(term, "rootfs [" + _bar(f, bw) + "] " + Math.round(f * 100) + "%  "
+        + _mb(got) + "/" + _mb(total) + "M");
+    });
+  } catch(e){ err("could not load rootfs.tar (" + e.message + "): build it with make rootfs, or download it from the release."); return; }
+  bootStatus(term, "unpacking the file system…");
+  // bash reads the banner rc during init (--rcfile) and busybox ash via $ENV, so
+  // the rc's `clear` wipes bash/ash's job-control warnings ("cannot set terminal
+  // process group" / "can't access tty") in the same startup burst, before the
+  // prompt — no ugly flash, no 250ms delayed source.
+  const argv = cmd==="busybox"
+    ? ["/bin/busybox","sh"]
+    : ["/bin/bash","--noprofile","--rcfile","/root/.bloprc","-i"];
+
+  // ghostty's render loop is a RAF loop on the main thread; it's frozen while the
+  // synchronous untar (big rootfs) blocks the thread, and resumes painting only
+  // when something nudges it. So the FIRST time the guest produces output we force
+  // a resync (same effect as a manual window resize) — anchored to real output,
+  // not a fixed timer that may fire before/after boot. Cheap: fires twice, once.
+  let kicked = false;
+  const kick = () => {
+    if (kicked) return; kicked = true;
+    setTimeout(()=>resync(t), 30);
+    setTimeout(()=>resync(t), 350);
+  };
+
+  const mod = {
+    locateFile: (p)=> p.endsWith(".wasm") ? ("blink.threads.wasm?v="+ASSET_V) : p,
+    arguments: argv,
+    print:    l => { term.write(l + "\r\n"); kick(); },
+    printErr: l => { term.write(l + "\r\n"); kick(); },
+    preRun: [function(){
+      const FS = mod.FS, TTY = mod.TTY, ENV = mod.ENV;
+      // Extract the rootfs asynchronously so the main thread (and ghostty's render
+      // loop) never freezes — even on a 2nd tab where the download is cached and the
+      // big untar would otherwise block before anything paints. addRunDependency
+      // holds main() until extraction completes.
+      if (typeof mod.addRunDependency === "function"){
+        mod.addRunDependency("rootfs-untar");
+        untarAsync(tar, FS, frac => bootStatus(term, "unpacking the file system… " + Math.round(frac*100) + "%"))
+          .then(()=>{ installApplets(FS); writeProcStatic(FS); try { FS.writeFile("/root/.bloprc", BANNER_RC); FS.writeFile("/root/hi.c", HI_C); } catch(e){}
+                      mod.removeRunDependency("rootfs-untar"); });
+      } else {
+        untar(tar, FS); installApplets(FS); writeProcStatic(FS);
+        try { FS.writeFile("/root/.bloprc", BANNER_RC); FS.writeFile("/root/hi.c", HI_C); } catch(e){}
+      }
+      const ICANON = 0x2, ECHO = 0x8, VMIN = 6;
+      let termios = { c_iflag:25856, c_oflag:5, c_cflag:191, c_lflag:35387,
+        c_cc:[3,28,127,21,4,0,1,0,17,19,26,0,18,15,23,22,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] };
+      const ops = {
+        get_char: () => {
+          // undefined blocks the read; null ends it, which is what a raw mode
+          // read with VMIN=0 does when there's nothing (btop drains input so)
+          if (!stdinBuffer.length)
+            return (termios.c_lflag & ICANON) || termios.c_cc[VMIN] ? undefined : null;
+          const ch = stdinBuffer.shift();
+          if (termios.c_lflag & ECHO){
+            if (ch === 13 || ch === 10) term.write("\r\n");
+            else if (ch === 127 || ch === 8) term.write("\b \b");
+            else if (ch >= 32) term.write(String.fromCharCode(ch));
+          }
+          return ch;
+        },
+        put_char: (tty,val) => {
+          // ONLCR: in cooked output mode (OPOST|ONLCR) a bare \n becomes \r\n, like
+          // a real tty. ghostty is a faithful VT (LF = line-feed only) and its
+          // convertEol doesn't apply to Uint8Array writes, so without this the
+          // guest's \n staircases. Raw mode (vi) clears OPOST → bytes pass through.
+          if (val === 10 && (termios.c_oflag & 1) && (termios.c_oflag & 4)) term.write("\r\n");
+          else term.write(new Uint8Array([val]));
+          kick();
+        },
+        flush: ()=>{}, fsync: ()=>{},
+        poll: () => stdinBuffer.length>0 ? (1|4) : 4,
+        ioctl_tcgets: () => termios,
+        ioctl_tcsets: (tty, opt, data) => { termios = data; return 0; },
+        ioctl_tiocgwinsz: () => [term.rows || 24, term.cols || 80],   // guest reads the live size
+      };
+      TTY.register(FS.makedev(5,0), ops); TTY.register(FS.makedev(6,0), ops);
+      FS.devices[FS.makedev(5,0)].stream_ops.poll = ops.poll;
+      FS.devices[FS.makedev(6,0)].stream_ops.poll = ops.poll;
+      ENV.TERM="xterm-256color"; ENV.HOME="/root"; ENV.PATH="/bin:/usr/bin"; ENV.PS1="blop:\\w\\$ ";
+      ENV.ENV="/root/.bloprc";   // busybox ash sources $ENV on interactive startup
+      try { FS.chdir("/root"); } catch(e){}
+    }],
+  };
+
+  bootStatus(term, "loading the blink emulator (WASM)…");
+  await loadBlink();
+  bootStatus(term, "starting the x86-64 machine…");
+  let inst;
+  try { inst = await createBlink(mod); }
+  catch(e){ err("init blink: "+e); return; }
+  bootStatus(term, "");                 // clear the status line; bash banner takes over
+  t.inst = inst;
+  if (activeTab===t) term.focus();
+  // the real first-paint nudge is kick() on first guest output; this is just a
+  // backstop in case nothing is printed promptly.
+  setTimeout(()=>resync(t), 1500);
+  try { inst.callMain(argv); } catch(e){ /* exit -> ExitStatus, normal */ }
+}
+
+// keep the active tab sized to the glass (window resize, rotation, panel changes)
+addEventListener("resize", ()=>fit(activeTab));
+try { new ResizeObserver(()=>fit(activeTab)).observe(termsEl); } catch(e){}
+addEventListener("click", ()=>{ if (activeTab) activeTab.term.focus(); });
+newtab.addEventListener("click", ()=>newTab("bash"));
+// stop rendering entirely when the browser tab/window is hidden; resume on return
+document.addEventListener("visibilitychange", ()=>{
+  if (!activeTab) return;
+  if (document.hidden) pauseRender(activeTab);
+  else { resumeRender(activeTab); resync(activeTab); }
+});
+// re-measure once fonts are ready (metrics can change) and re-fit after layout settles
+try { document.fonts && document.fonts.ready.then(()=>{ _cellW = 0; fit(activeTab); }); } catch(e){}
+setTimeout(()=>fit(activeTab), 250);
+
+// boot: load the ghostty-web WASM once, then open the first shell.
+init()
+  .then(() => newTab(CMD0))
+  .catch(err => {
+    const m = document.createElement("div");
+    m.style.cssText = "position:fixed;inset:0;display:grid;place-items:center;color:#ff8a8a;"
+      + "font:13px ui-monospace,monospace;padding:24px;text-align:center;background:#05080a";
+    m.textContent = "ghostty-web did not start: " + err + "  —  fallback: index-xterm.html";
+    document.body.appendChild(m);
+  });
+</script>
+</body></html>

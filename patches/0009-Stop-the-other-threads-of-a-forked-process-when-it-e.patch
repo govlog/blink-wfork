@@ -1,0 +1,355 @@
+From 6202c843a9b065e81dfe84508c2c691b1f6b1689 Mon Sep 17 00:00:00 2001
+From: Christopher AMIAUD <christopher.amiaud@gmail.com>
+Date: Mon, 5 Oct 2026 13:19:21 +0200
+Subject: [PATCH 9/9] Stop the other threads of a forked process when it exits
+
+With threaded fork(), the threads of a child process are host threads
+of blink, so they outlived it: exit() left them running or waiting,
+along with the copy of the address space they use, and a fatal signal
+asked them to stop, which they didn't notice while waiting, since no
+host signal interrupts their wait. The parent then waited forever to
+join the thread which started the process, if that one still waited:
+a shell hung when a thread of btop crashed, or when a thread called
+exit() while the main one read a pipe.
+
+exit_group() now calls KillOtherThreads() for child processes too, and
+CheckInterrupt() and the loops that wait for i/o, children or SIGCONT
+end their wait once their thread is killed.
+
+The table of processes also no longer takes a process for the thread
+which started it: when that thread is gone, another one stands for it,
+and the cpu time of a process counts all its threads, past and present.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ blink/memorymalloc.c |  8 ++++
+ blink/pipe.c         |  6 +--
+ blink/syscall.c      | 14 ++++---
+ blink/threadfork.c   | 92 ++++++++++++++++++++++++++++++++++++--------
+ blink/threadfork.h   |  2 +
+ 5 files changed, 96 insertions(+), 26 deletions(-)
+
+diff --git a/blink/memorymalloc.c b/blink/memorymalloc.c
+index c9a535e..da6ab72 100644
+--- a/blink/memorymalloc.c
++++ b/blink/memorymalloc.c
+@@ -38,6 +38,7 @@
+ #include "blink/pml4t.h"
+ #include "blink/random.h"
+ #include "blink/thread.h"
++#include "blink/threadfork.h"
+ #include "blink/timespec.h"
+ #include "blink/types.h"
+ #include "blink/util.h"
+@@ -413,6 +414,10 @@ struct Machine *NewMachine(struct System *system, struct Machine *parent) {
+   m->system = system;
+   m->mode = system->mode;
+   m->thread = pthread_self();
++#ifdef HAVE_THREADED_FORK
++  m->runtime = 0;
++  m->runsince = ToNanoseconds(GetMonotonic());
++#endif
+   Write32(m->sigaltstack.flags, SS_DISABLE_LINUX);
+   if (parent) {
+     m->tid = (system->next_tid++ & (kMaxThreadIds - 1)) + kMinThreadId;
+@@ -443,6 +448,9 @@ void FreeMachine(struct Machine *m) {
+     unassert((s = m->system));
+     m->sysdepth = 0;
+     CollectPageLocks(m);
++#ifdef HAVE_THREADED_FORK
++    RemoveThread(m);
++#endif
+     LOCK(&s->machines_lock);
+     dll_remove(&s->machines, &m->elem);
+     if (!(orphan = dll_is_empty(s->machines))) {
+diff --git a/blink/pipe.c b/blink/pipe.c
+index 5f396d6..45141ec 100644
+--- a/blink/pipe.c
++++ b/blink/pipe.c
+@@ -35,6 +35,7 @@
+ #include "blink/ndelay.h"
+ #include "blink/syscall.h"
+ #include "blink/thread.h"
++#include "blink/threadfork.h"
+ #include "blink/timespec.h"
+ #include "blink/vfs.h"
+ #include "blink/xlat.h"
+@@ -71,13 +72,12 @@ static struct Pipe *GetPipe(int handle) {
+   return g_pipes.p + ((handle & ~kPipeHandle) >> 1);
+ }
+ 
+-// waits for the pipe to change, or returns false if a signal arrives.
+-// other processes signal us without a host signal to interrupt this.
++// waits for the pipe to change, or returns false if interrupted
+ static bool WaitPipe(struct Pipe *p) {
+   struct timespec deadline;
+   deadline = AddTime(GetTime(), FromMilliseconds(100));
+   pthread_cond_timedwait(&p->cond, &g_pipes.lock, &deadline);
+-  return !(g_machine->signals & ~g_machine->sigmask);
++  return !IsInterrupted(g_machine);
+ }
+ 
+ static int OpenPipe(int handles[2]) {
+diff --git a/blink/syscall.c b/blink/syscall.c
+index a3a6401..a3bc025 100644
+--- a/blink/syscall.c
++++ b/blink/syscall.c
+@@ -175,8 +175,7 @@ ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
+   if (VfsFcntl(fd, F_GETFL, 0) & O_NONBLOCK) return VfsReadv(fd, iov, iovcnt);
+   while ((rc = VfsReadv(fd, iov, iovcnt)) == -1 && errno == EAGAIN) {
+     EmYield(50);
+-    // other processes signal us without a host signal to interrupt this
+-    if (g_machine && (g_machine->signals & ~g_machine->sigmask)) {
++    if (g_machine && IsInterrupted(g_machine)) {
+       return eintr();
+     }
+   }
+@@ -307,6 +306,11 @@ bool DeliverSignalRecursively(struct Machine *m, int sig) {
+ bool CheckInterrupt(struct Machine *m, bool restartable) {
+   bool res, restart;
+   int sig, delivered;
++  // KillOtherThreads() wants this thread gone, so don't restart its i/o
++  if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
++    errno = EINTR;
++    return true;
++  }
+   // an actual i/o call just received EINTR from the kernel
+ HandleSomeMoreInterrupts:
+   // determine if there's any signals pending for our guest
+@@ -396,6 +400,7 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
+   ClearChildTid(m);
+   if (m->system->isfork) {
+ #ifdef HAVE_THREADED_FORK
++    KillOtherThreads(m->system);  // since they're host threads too
+     ExitChildProcess(m, (rc & 255) << 8);
+ #endif
+ #ifndef NDEBUG
+@@ -607,8 +612,6 @@ static int ThreadFork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
+   }
+   SetProcessMachine(pid, m2);
+   m2->tid = pid;
+-  m2->runtime = 0;
+-  m2->runsince = ToNanoseconds(GetMonotonic());
+   ResetTlb(m2);
+   Put64(m2->ax, 0);
+   if (stack) Put64(m2->sp, stack);
+@@ -4173,10 +4176,9 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
+     if (CompareTime(now, deadline) >= 0) return 0;
+     ts = SubtractTime(deadline, now);
+ #ifdef HAVE_THREADED_FORK
+-    // other processes signal us without a host signal to interrupt this
+     if (CompareTime(ts, FromMilliseconds(100)) > 0) ts = FromMilliseconds(100);
+     nanosleep(&ts, 0);
+-    if (m->signals & ~m->sigmask) {
++    if (IsInterrupted(m)) {
+ #else
+     if (nanosleep(&ts, 0)) {
+       unassert(errno == EINTR);
+diff --git a/blink/threadfork.c b/blink/threadfork.c
+index 0f55d31..eca2967 100644
+--- a/blink/threadfork.c
++++ b/blink/threadfork.c
+@@ -39,6 +39,7 @@
+ #include "blink/macros.h"
+ #include "blink/signal.h"
+ #include "blink/timespec.h"
++#include "blink/tunables.h"
+ #include "blink/util.h"
+ #include "blink/vfs.h"
+ #include "blink/xlat.h"
+@@ -60,8 +61,6 @@
+ // Since all guest processes now share the host's file descriptors, it
+ // implies HAVE_VIRTUAL_FDS. It also needs non-linear memory, to let a
+ // guest address map to different host memory in each process.
+-//
+-// TODO: Stop the other threads of a child process when it exits.
+ 
+ struct Proc {
+   struct Proc *next;
+@@ -76,8 +75,9 @@ struct Proc {
+   int cmdlen;
+   char cmdline[256];  // the NUL-separated argv of the program it runs
+   i64 start;          // nanoseconds since boot when it was forked
++  i64 runtime;        // cpu time of its threads which are gone
+   pthread_t thread;
+-  struct Machine *m;  // changes on execve()
++  struct Machine *m;  // one of its threads, which changes on execve()
+ };
+ 
+ static struct Procs {
+@@ -107,6 +107,21 @@ static i64 GetNanos(void) {
+   return ToNanoseconds(GetMonotonic());
+ }
+ 
++// returns the cpu time used by thread `m`, as OpSyscall() tracks it
++static i64 GetThreadTime(struct Machine *m, i64 now, bool stopped) {
++  return m->runtime + (m->insyscall || stopped ? 0 : now - m->runsince);
++}
++
++// waits for a process to change, or for a moment, since that's how the
++// threads KillOtherThreads() wants gone notice, without host signals
++static void WaitProcs(void) {
++  int rc;
++  struct timespec deadline;
++  deadline = AddTime(GetTime(), FromMilliseconds(kPollingMs));
++  rc = pthread_cond_timedwait(&g_procs.cond, &g_procs.lock, &deadline);
++  unassert(rc == 0 || rc == ETIMEDOUT);
++}
++
+ #ifdef __EMSCRIPTEN__
+ // Emscripten builds have no procfs, so blink writes /proc itself, when
+ // a program opens something under /proc, so ps, top and htop see the
+@@ -157,11 +172,21 @@ static void PrintProcFile(const char *path, const char *fmt, ...) {
+   }
+ }
+ 
+-// returns cpu time used by `p`, whose machine is updated by OpSyscall()
++// returns the cpu time used by all the threads of process `p`
+ static i64 GetCpuTime(struct Proc *p, i64 now) {
+-  struct Machine *m;
+-  if (!(m = p->m)) return 0;
+-  return m->runtime + (m->insyscall || p->stopped ? 0 : now - m->runsince);
++  i64 res;
++  struct Dll *e;
++  struct System *s;
++  res = p->runtime;
++  if (!p->zombie && p->m) {
++    s = p->m->system;
++    LOCK(&s->machines_lock);
++    for (e = dll_first(s->machines); e; e = dll_next(s->machines, e)) {
++      res += GetThreadTime(MACHINE_CONTAINER(e), now, p->stopped);
++    }
++    UNLOCK(&s->machines_lock);
++  }
++  return res;
+ }
+ 
+ static void GetProcInfo(struct ProcInfo *pi, struct Proc *p, i64 now) {
+@@ -410,7 +435,7 @@ static void FreeProc(struct Proc *p) {
+   // the thread may still be unwinding after it marked itself a zombie
+   unassert(!pthread_join(p->thread, 0));
+   LOCK(&g_procs.lock);
+-  g_procs.dead += p->m->runtime;
++  g_procs.dead += p->runtime;
+   UNLOCK(&g_procs.lock);
+   UnpublishProc(p->pid);
+   FreeMachine(p->m);
+@@ -449,13 +474,12 @@ void AddMainProcess(struct Machine *m) {
+   unassert((p = (struct Proc *)calloc(1, sizeof(*p))));
+   p->pid = p->pgid = m->system->pid;
+   p->m = m;
+-  m->runsince = GetNanos();
+   LOCK(&g_procs.lock);
+   p->next = g_procs.list;
+   g_procs.list = p;
+   g_procs.lastpid = MAX(g_procs.lastpid, p->pid);
+   g_procs.fgpgid = p->pgid;
+-  g_procs.boot = m->runsince;
++  g_procs.boot = GetNanos();
+   UNLOCK(&g_procs.lock);
+   PublishCpus();
+ }
+@@ -505,13 +529,46 @@ void SetProcessMachine(int pid, struct Machine *m) {
+     if (p->m && (m->signals |= p->m->signals)) {
+       atomic_store_explicit(&m->attention, true, memory_order_release);
+     }
+-    if (p->m) m->runtime = p->m->runtime;  // cpu time survives execve() too
+-    m->runsince = GetNanos();
+     p->m = m;
+   }
+   UNLOCK(&g_procs.lock);
+ }
+ 
++// called by FreeMachine() before thread `m` leaves its process, whose
++// cpu time it adds to, and which lives on in one of its other threads
++void RemoveThread(struct Machine *m) {
++  struct Dll *e;
++  struct Proc *p;
++  struct Machine *m2;
++  struct System *s = m->system;
++  LOCK(&g_procs.lock);
++  if ((p = FindProc(s->pid)) && !p->zombie) {
++    p->runtime += GetThreadTime(m, GetNanos(), p->stopped);
++    m->runtime = 0;
++    m->killed = true;  // so it won't be picked below by another thread
++    if (p->m == m) {
++      p->m = 0;
++      LOCK(&s->machines_lock);
++      for (e = dll_first(s->machines); e; e = dll_next(s->machines, e)) {
++        if (!(m2 = MACHINE_CONTAINER(e))->killed) {
++          p->m = m2;
++          break;
++        }
++      }
++      UNLOCK(&s->machines_lock);
++    }
++  }
++  UNLOCK(&g_procs.lock);
++}
++
++// returns true if thread `m` must stop waiting, since it has a signal
++// to handle, or KillOtherThreads() wants it gone: no host signal will
++// interrupt its wait, since other processes are other threads here
++bool IsInterrupted(struct Machine *m) {
++  return atomic_load_explicit(&m->killed, memory_order_acquire) ||
++         (m->signals & ~m->sigmask);
++}
++
+ void SetChildThread(int pid, pthread_t thread) {
+   struct Proc *p;
+   LOCK(&g_procs.lock);
+@@ -540,6 +597,7 @@ _Noreturn void ExitChildProcess(struct Machine *m, int wstatus) {
+   UNLOCK(&m->system->fds.lock);
+   LOCK(&g_procs.lock);
+   if ((p = FindProc(m->system->pid))) {
++    p->runtime += GetThreadTime(m, GetNanos(), p->stopped);
+     p->m = m;
+     p->wstatus = wstatus;
+     p->zombie = true;
+@@ -559,8 +617,8 @@ void StopProcess(struct Machine *m, int sig) {
+     p->changed = true;
+     p->wstatus = sig << 8 | 0x7f;  // WIFSTOPPED
+     NotifyParent(p);
+-    while (p->stopped) {
+-      unassert(!pthread_cond_wait(&g_procs.cond, &g_procs.lock));
++    while (p->stopped && !m->killed) {
++      WaitProcs();
+     }
+   }
+   UNLOCK(&g_procs.lock);
+@@ -599,8 +657,8 @@ int WaitChildProcess(struct Machine *m, int pid, i64 wstatusaddr, int options,
+         break;
+       }
+     }
+-    if (p || !any || (options & WNOHANG)) break;
+-    unassert(!pthread_cond_wait(&g_procs.cond, &g_procs.lock));
++    if (p || !any || (options & WNOHANG) || m->killed) break;
++    WaitProcs();
+   }
+   if (p) {
+     rc = p->pid;
+@@ -608,7 +666,7 @@ int WaitChildProcess(struct Machine *m, int pid, i64 wstatusaddr, int options,
+     reap = p->zombie;
+   }
+   UNLOCK(&g_procs.lock);
+-  if (!p) return any ? 0 : echild();
++  if (!p) return !any ? echild() : m->killed ? eintr() : 0;
+   if (reap) FreeProc(p);
+   if (wstatusaddr) {
+     Write32(gwstatus, ws);
+diff --git a/blink/threadfork.h b/blink/threadfork.h
+index fcc42fa..dcd7092 100644
+--- a/blink/threadfork.h
++++ b/blink/threadfork.h
+@@ -24,6 +24,8 @@ int SetProcessGroup(struct Machine *, int, int);
+ int GetForegroundGroup(void);
+ void SetForegroundGroup(int);
+ void SetTtyIsig(bool);
++void RemoveThread(struct Machine *);
++bool IsInterrupted(struct Machine *);
+ 
+ #endif /* HAVE_THREADED_FORK */
+ #endif /* BLINK_THREADFORK_H_ */
+-- 
+2.53.0
+

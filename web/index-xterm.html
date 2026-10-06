@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>shell.blop.foo — real bash, emulated x86-64, in a CRT</title>
+<meta name="description" content="A real x86-64 bash, emulated in your browser (WebAssembly) by a fork of jart/blink that adds fork(), pipes and job control, in a CRT terminal.">
+<meta name="theme-color" content="#05070a">
+<!-- COI service worker FIRST: it installs COOP/COEP so SharedArrayBuffer (the
+     fork-enabled threads build) works on any static host, no server headers. -->
+<script src="coi-serviceworker.js"></script>
+<link rel="stylesheet" href="xterm.css"/>
+<script src="xterm.min.js"></script>
+<style>
+  :root{ --phosphor:#39ffae; --tab-fg:#7c8a82; --chin:64px; }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:radial-gradient(130% 120% at 50% 12%, #0c1119 0%, #06080d 58%, #020305 100%);
+    overflow:hidden;
+    font-family:'JetBrains Mono','Fira Code',ui-monospace,Menlo,Consolas,monospace;
+    color:#5b6675;
+  }
+  .room{position:fixed;inset:0;display:grid;place-items:center;padding:clamp(6px,2.2vmin,40px)}
+
+  /* ---- the drawn monitor: graphite plastic, beveled, recessed glass ---- */
+  .monitor{position:relative;width:100%;height:100%;max-width:1600px}
+  .bezel{
+    position:relative;width:100%;height:100%;
+    border-radius:clamp(16px,2.4vmin,30px);
+    padding:clamp(12px,2.2vmin,28px);
+    padding-bottom:var(--chin);
+    background:linear-gradient(157deg,#2c313a 0%,#202530 55%,#13161d 100%);
+    box-shadow:
+      inset 0 2px 0 rgba(255,255,255,.07),
+      inset 0 -4px 10px rgba(0,0,0,.65),
+      inset 0 0 0 1px rgba(0,0,0,.45),
+      0 36px 70px -22px rgba(0,0,0,.85),
+      0 0 0 1px rgba(0,0,0,.5);
+  }
+  /* recessed screen: deep inner shadow = the glass sits inside the case */
+  .screen{
+    position:relative;width:100%;height:100%;
+    display:flex;flex-direction:column;
+    border-radius:clamp(8px,1.4vmin,16px);
+    overflow:hidden;background:#04070a;
+    box-shadow:
+      inset 0 0 0 2px rgba(0,0,0,.85),
+      inset 0 0 70px 14px rgba(0,0,0,.92),
+      inset 0 0 140px 36px rgba(20,60,40,.10);
+  }
+
+  /* ---- tab strip (sits inside the glass, under the CRT layers) ---- */
+  .tabbar{
+    flex:0 0 auto;display:flex;align-items:stretch;gap:3px;
+    height:32px;padding:5px 7px 0;
+    background:linear-gradient(#0a1410,#060c0a);
+    font:600 11px/1 ui-monospace,monospace;
+    z-index:3;
+  }
+  .tab{
+    display:flex;align-items:center;gap:7px;max-width:180px;padding:0 9px;
+    border-radius:8px 8px 0 0;cursor:pointer;white-space:nowrap;color:var(--tab-fg);
+    background:rgba(255,255,255,.03);user-select:none;transition:color .12s,background .12s;
+  }
+  .tab:hover{color:#aebbb2}
+  .tab.active{background:#05080a;color:var(--phosphor);text-shadow:0 0 5px rgba(57,255,174,.5)}
+  .tab .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto;opacity:.8}
+  .tab .lbl{overflow:hidden;text-overflow:ellipsis}
+  .tab .x{margin-left:2px;opacity:.45;font-weight:700;padding:0 2px;border-radius:4px}
+  .tab .x:hover{opacity:1;color:#ff8a8a;background:rgba(255,138,138,.12)}
+  .newtab{
+    align-self:center;width:23px;height:23px;margin-left:3px;border-radius:7px;
+    display:grid;place-items:center;cursor:pointer;color:var(--tab-fg);
+    background:rgba(255,255,255,.04);font-size:16px;font-weight:700;line-height:0;
+    transition:color .12s,background .12s;
+  }
+  .newtab:hover{color:var(--phosphor);background:rgba(57,255,174,.10)}
+
+  /* ---- terminal stack ---- */
+  .terms{position:relative;flex:1;min-height:0}
+  .termwrap{position:absolute;inset:0;padding:12px 8px 8px 12px}
+  .xterm{height:100%}
+  /* phosphor bloom: every glyph glows in its own colour (keeps ANSI colours) */
+  .xterm .xterm-rows{ text-shadow:0 0 2px currentColor; }
+  .termwrap{ filter:contrast(1.07) brightness(1.05) saturate(1.12); }
+
+  /* ---- ghostty-style scrollbar: thin overlay, rounded, low-contrast ---- */
+  .xterm-viewport{scrollbar-width:thin;scrollbar-color:rgba(120,200,160,.22) transparent}
+  .xterm-viewport::-webkit-scrollbar{width:10px;height:10px}
+  .xterm-viewport::-webkit-scrollbar-track{background:transparent}
+  .xterm-viewport::-webkit-scrollbar-thumb{
+    background:rgba(120,200,160,.22);border-radius:8px;
+    border:3px solid transparent;background-clip:content-box;min-height:28px;
+    transition:background .15s;
+  }
+  .xterm-viewport:hover::-webkit-scrollbar-thumb{background:rgba(120,200,160,.36);background-clip:content-box}
+  .xterm-viewport::-webkit-scrollbar-thumb:hover{background:rgba(120,255,190,.5);background-clip:content-box}
+  .xterm-viewport::-webkit-scrollbar-corner{background:transparent}
+
+  /* ---- CRT layers (all non-interactive, above everything in the glass) ---- */
+  .crt{position:absolute;inset:0;pointer-events:none;z-index:5}
+  .crt-scanlines{
+    background:repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0, rgba(0,0,0,0) 2px, rgba(0,0,0,.26) 3px, rgba(0,0,0,.26) 3px);
+    background-size:100% 3px; mix-blend-mode:multiply;
+  }
+  .crt-mask{
+    background:repeating-linear-gradient(to right,
+      rgba(255,0,0,.04), rgba(0,255,0,.03) 1px, rgba(0,0,255,.04) 2px, transparent 3px);
+    mix-blend-mode:screen; opacity:.6;
+  }
+  .crt-vignette{ background:radial-gradient(125% 125% at 50% 50%, transparent 52%, rgba(0,0,0,.62) 100%); }
+  .crt-glare{ background:linear-gradient(128deg, rgba(255,255,255,.07) 0%, transparent 38%); }
+  .crt-sweep{
+    background:linear-gradient(to bottom, transparent, rgba(180,255,220,.05) 50%, transparent);
+    height:38%; top:-38%; animation:sweep 7.5s linear infinite;
+  }
+  .crt-flicker{ background:rgba(120,255,180,.018); animation:flicker 7s steps(2,end) infinite; }
+  @keyframes sweep{ to{ transform:translateY(380%);} }
+  @keyframes flicker{
+    0%,100%{opacity:.20} 8%{opacity:.55} 9%{opacity:.20}
+    40%{opacity:.22} 41%{opacity:.62} 42%{opacity:.20} 74%{opacity:.30}
+  }
+  .poweron{position:absolute;inset:0;background:#dffbe9;pointer-events:none;z-index:6;
+    animation:poweron 850ms ease-out forwards}
+  @keyframes poweron{
+    0%{opacity:1; clip-path:inset(49.7% 0 49.7% 0)}
+    30%{opacity:1; clip-path:inset(0 0 0 0)}
+    55%{opacity:.35}
+    100%{opacity:0}
+  }
+
+  /* ---- bezel chin: brand + power LED ---- */
+  .brand{
+    position:absolute;left:0;right:0;bottom:0;height:var(--chin);
+    display:flex;align-items:center;justify-content:center;gap:10px;
+    font:600 11px/1 ui-monospace,monospace;letter-spacing:.22em;text-transform:uppercase;
+    color:#4d5765;user-select:none;
+  }
+  .brand b{color:#7f8b9a;font-weight:700}
+  .brand .srclink{color:inherit;text-decoration:none;user-select:auto}
+  .brand .srclink:hover{color:#7f8b9a}
+  .led{width:9px;height:9px;border-radius:50%;background:var(--phosphor);
+    box-shadow:0 0 9px 2px rgba(57,255,174,.7), inset 0 0 2px rgba(0,0,0,.4);
+    animation:pulse 3.4s ease-in-out infinite}
+  @keyframes pulse{50%{box-shadow:0 0 5px 1px rgba(57,255,174,.45)}}
+
+  @media (prefers-reduced-motion: reduce){
+    .crt-sweep,.crt-flicker,.led,.poweron{animation:none}
+    .poweron{display:none}
+  }
+</style>
+</head>
+<body>
+  <div class="room">
+    <div class="monitor">
+      <div class="bezel">
+        <div class="screen">
+          <div class="tabbar" id="tabbar">
+            <div class="newtab" id="newtab" title="new shell">+</div>
+          </div>
+          <div class="terms" id="terms"></div>
+          <div class="crt crt-mask"></div>
+          <div class="crt crt-scanlines"></div>
+          <div class="crt crt-sweep"></div>
+          <div class="crt crt-vignette"></div>
+          <div class="crt crt-glare"></div>
+          <div class="crt crt-flicker"></div>
+          <div class="poweron"></div>
+        </div>
+        <div class="brand"><span class="led"></span> blop <b>CRT&middot;9000</b> &mdash; x86-64 &middot; <a class="srclink" href="SOURCES.txt" target="_blank" rel="noopener" title="sources of the free software (GPL)">sources</a></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const Q    = new URLSearchParams(location.search);
+const CMD0 = (Q.get("cmd") || "bash").toLowerCase();         // command for the first tab
+const ACC  = "#" + (Q.get("accent") || "39ffae").replace(/[^0-9a-fA-F]/g,"").slice(0,6).padEnd(6,"f");
+const FONT = 14;
+const FONTFAM = "'JetBrains Mono','Fira Code',ui-monospace,Menlo,Consolas,monospace";
+// bump on every artefact change → cache-busts rootfs.tar + blink.threads.{js,wasm}
+// (darkhttpd ignores the query; the browser keys its cache on the full URL).
+const ASSET_V = "20260614b";
+
+// Green-leaning phosphor palette that still renders ANSI colours truthfully.
+const theme = {
+  background:"#05080a", foreground:"#cfe8d8", cursor:ACC,
+  selectionBackground:"rgba(57,255,174,.25)",
+  black:"#1d2630", red:"#ff6b6b", green:"#9ece6a", yellow:"#e0af68",
+  blue:"#7aa2f7", magenta:"#bb9af7", cyan:"#7dcfff", white:"#cfe8d8",
+  brightBlack:"#566173", brightRed:"#ff8a8a", brightGreen:"#b9f27c",
+  brightYellow:"#f0c987", brightBlue:"#9ab8ff", brightMagenta:"#d2b8ff",
+  brightCyan:"#a4e4ff", brightWhite:"#eafff4",
+};
+
+// ---- shared, lazily-loaded resources ----
+let _blinkScript = null, _rootfs = null;
+const coiOk = self.crossOriginIsolated;
+function loadBlink(){
+  if (!_blinkScript) _blinkScript = new Promise((res,rej)=>{
+    const s=document.createElement("script");
+    s.src="blink.threads.js?v="+ASSET_V; s.onload=res; s.onerror=()=>rej(new Error("blink.threads.js"));
+    document.head.appendChild(s);                       // defines createBlink() once, reused per tab
+  });
+  return _blinkScript;
+}
+async function getRootfs(){
+  if (!_rootfs){
+    const resp = await fetch("rootfs.tar?v="+ASSET_V);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    _rootfs = new Uint8Array(await resp.arrayBuffer());
+  }
+  return _rootfs;
+}
+
+// minimal tar extractor into the emscripten FS (recreates busybox symlinks).
+function untar(buf, FS){
+  let off=0;
+  const str=(s,len)=>{let r="";for(let i=s;i<s+len;i++){if(buf[i]===0)break;r+=String.fromCharCode(buf[i]);}return r;};
+  const dirOf=p=>{const i=p.lastIndexOf("/");return i<=0?"/":p.slice(0,i);};
+  while(off+512<=buf.length){
+    const name=str(off,100); if(!name){off+=512;continue;}
+    const mode=parseInt(str(off+100,8).trim(),8)||0o644;
+    const size=parseInt(str(off+124,12).trim(),8)||0;
+    const type=String.fromCharCode(buf[off+156]||48);
+    const link=str(off+157,100); const prefix=str(off+345,155);
+    let path=(prefix?prefix+"/":"")+name; path="/"+path.replace(/^\.?\/+/,"").replace(/\/+$/,""); off+=512;
+    try{
+      if(type==="5"){try{FS.mkdirTree(path);}catch(e){}}
+      else if(type==="2"){try{FS.mkdirTree(dirOf(path));}catch(e){}try{FS.unlink(path);}catch(e){}try{FS.symlink(link,path);}catch(e){}}
+      else if(type==="0"||type===" "||type==="7"){try{FS.mkdirTree(dirOf(path));}catch(e){}FS.writeFile(path,buf.subarray(off,off+size));try{FS.chmod(path,mode);}catch(e){}}
+    }catch(e){}
+    off+=Math.ceil(size/512)*512;
+  }
+}
+
+// busybox applets -> symlinks so `ls`, `cat`, `grep`… resolve to real binaries
+const APPLETS = ("ls ll cat grep sed head tail wc sort uniq echo pwd cut tr od xxd find sleep " +
+  "env whoami id uname hostname date dirname basename mkdir rmdir touch rm cp mv ln chmod chown " +
+  "true false yes seq printf clear tee less more vi awk ps top kill du df stat readlink realpath " +
+  "wget tar gzip gunzip md5sum sha256sum base64 nl tac rev fold xargs which mktemp").split(" ");
+function installApplets(FS){ for (const a of APPLETS){ try{ FS.symlink("/bin/busybox", "/bin/"+a); }catch(e){} } }
+
+// static, machine-level /proc nodes so `cat /proc/cpuinfo`, `uptime`, `free` and
+// `top` (which reads /proc/stat + /proc/meminfo) work. The per-process /proc/<pid>
+// entries are materialised by the blink fork itself, so `ps`/`top` list real procs.
+function writeProcStatic(FS){
+  const W = (p, s) => { try { FS.writeFile(p, s); } catch(e){} };
+  try { FS.mkdirTree("/proc"); } catch(e){}
+  W("/proc/cpuinfo",
+    "processor\t: 0\nvendor_id\t: BlinkGenuine\ncpu family\t: 6\n" +
+    "model name\t: blink x86-64 emulator (WASM)\ncpu MHz\t\t: 1000.000\n" +
+    "cache size\t: 0 KB\nflags\t\t: fpu sse sse2 lm\nbogomips\t: 2000.00\n\n");
+  W("/proc/meminfo",
+    "MemTotal:        262144 kB\nMemFree:         131072 kB\nMemAvailable:    196608 kB\n" +
+    "Buffers:              0 kB\nCached:               0 kB\nSwapTotal:            0 kB\nSwapFree:             0 kB\n");
+  W("/proc/stat",
+    "cpu  0 0 0 1000 0 0 0 0 0 0\ncpu0 0 0 0 1000 0 0 0 0 0 0\n" +
+    "intr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n");
+  W("/proc/uptime", "1000.00 1000.00\n");
+  W("/proc/loadavg", "0.00 0.00 0.00 1/1 1\n");
+  W("/proc/version",
+    "Linux version 4.5.0-blink-wfork (blop) #1 SMP x86-64 emulated in WASM\n");
+  W("/proc/filesystems", "nodev\tproc\n\text4\n");
+}
+
+const E = "\x1b";
+// bash inits job control AFTER reading this rc, so its "cannot set terminal process
+// group / no job control" warnings print just before the FIRST prompt. We therefore
+// clear+print the banner from a one-shot PROMPT_COMMAND, which runs at the first
+// prompt (i.e. AFTER those warnings, before the first repaint) — wiping them cleanly.
+// busybox ash has no PROMPT_COMMAND: it sources this via $ENV at startup, so we
+// clear+print immediately in the else branch.
+const BANNER_RC =
+  'if [ -n "$BASH_VERSION" ]; then\n' +
+  "  PS1='\\[\\e[1;32m\\]blop\\[\\e[0m\\] \\[\\e[1;34m\\]\\w\\[\\e[0m\\] \\[\\e[1m\\]\\$\\[\\e[0m\\] '\n" +
+  '  __blop_motd() {\n' +
+  "    printf '" + E + "[2J" + E + "[H'\n" +
+  "    printf '" + E + "[1;32mGNU bash %s" + E + "[0m on x86-64 \\xe2\\x80\\x94 emulated in your browser by a fork of jart/blink\\n' \"${BASH_VERSION%%(*}\"\n" +
+  "    printf '" + E + "[2mreal binaries, real pipes, subshells & fork().  try:  ls -la /   ps   echo hi | sort   uname -a" + E + "[0m\\n\\n'\n" +
+  '    PROMPT_COMMAND=$__blop_prev; unset -f __blop_motd\n' +
+  '  }\n' +
+  '  __blop_prev=$PROMPT_COMMAND\n' +
+  '  PROMPT_COMMAND=__blop_motd\n' +
+  'else\n' +
+  "  PS1='" + E + "[1;32mblop" + E + "[0m " + E + "[1;34m\\w" + E + "[0m " + E + "[1m\\$" + E + "[0m '\n" +
+  "  printf '" + E + "[2J" + E + "[H'\n" +
+  "  printf '" + E + "[1;32mBusyBox ash" + E + "[0m on x86-64 \\xe2\\x80\\x94 emulated in your browser by a fork of jart/blink\\n'\n" +
+  "  printf '" + E + "[2mreal binaries, real pipes, subshells & fork().  try:  ls -la /   ps   echo hi | sort   uname -a" + E + "[0m\\n\\n'\n" +
+  'fi\n';
+
+// ---- resolution-aware fit: derive cols/rows from the REAL measured cell size
+// (xterm computes it from font metrics × devicePixelRatio — same source FitAddon uses). ----
+function cellSize(term){
+  try{
+    const d = term._core._renderService.dimensions;
+    const cell = (d && d.css && d.css.cell) ? d.css.cell : d;     // xterm 5.x vs 4.x
+    const w = cell.width  || (d && d.actualCellWidth);
+    const h = cell.height || (d && d.actualCellHeight);
+    if (w > 0 && h > 0) return { w, h };
+  }catch(e){}
+  return { w: FONT*0.6, h: Math.round(FONT*1.27) };                // pre-render fallback
+}
+function fit(t){
+  if (!t) return;
+  const { w:cw, h:ch } = cellSize(t.term);
+  const r = t.wrap.getBoundingClientRect();
+  const padX = 22, padY = 18;                                      // wrap padding + scrollbar
+  const cols = Math.max(20, Math.floor((r.width  - padX) / cw));
+  const rows = Math.max(6,  Math.floor((r.height - padY) / ch));
+  try{ t.term.resize(cols, rows); }catch(e){}
+}
+
+// ---- tabs ----
+const tabbar  = document.getElementById("tabbar");
+const newtab  = document.getElementById("newtab");
+const termsEl = document.getElementById("terms");
+const tabs = [];
+let activeTab = null, counter = 0;
+
+function feed(buf, s){ for (let i=0;i<s.length;i++) buf.push(s.charCodeAt(i) & 0xff); }
+const utf8 = new TextEncoder();   // keystrokes and pastes are JS strings; the guest reads UTF-8 bytes
+window.__feed = s => activeTab && feed(activeTab.stdinBuffer, s);   // handy for scripted testing
+
+function activate(t){
+  activeTab = t;
+  for (const x of tabs){
+    const on = x===t;
+    x.wrap.style.display = on ? "block" : "none";
+    x.btn.classList.toggle("active", on);
+  }
+  if (t) requestAnimationFrame(()=>{ fit(t); t.term.focus(); });
+}
+
+function closeTab(t){
+  const i = tabs.indexOf(t); if (i<0) return;
+  try{ feed(t.stdinBuffer, "exit\n"); }catch(e){}                  // let bash exit -> runtime + workers tear down
+  setTimeout(()=>{ try{ t.term.dispose(); }catch(e){} }, 200);
+  t.wrap.remove(); t.btn.remove();
+  tabs.splice(i,1);
+  if (activeTab===t) activate(tabs[Math.min(i, tabs.length-1)] || null);
+}
+
+function newTab(cmd){
+  counter++;
+  const id = counter;
+  const wrap = document.createElement("div"); wrap.className = "termwrap"; termsEl.appendChild(wrap);
+  const term = new Terminal({ convertEol:true, fontSize:FONT, cursorBlink:true, fontFamily:FONTFAM, theme });
+  term.open(wrap);
+  const stdinBuffer = [];
+  // forward every keystroke raw (ESC, CSI arrows, Tab, Ctrl-C). Echo is done the
+  // real Unix way (termios ECHO) by the kernel/programs — no JS-side echo.
+  term.onData(raw => { for (const b of utf8.encode(raw)) stdinBuffer.push(b); });
+
+  const btn = document.createElement("div"); btn.className = "tab";
+  btn.innerHTML = '<span class="dot"></span><span class="lbl"></span><span class="x" title="close">&times;</span>';
+  btn.querySelector(".lbl").textContent = (cmd==="busybox"?"sh":"shell") + " " + id;
+  const t = { id, term, wrap, btn, stdinBuffer, inst:null };
+  btn.addEventListener("click", e => {
+    if (e.target.classList.contains("x")) closeTab(t);
+    else activate(t);
+  });
+  tabbar.insertBefore(btn, newtab);
+  tabs.push(t);
+  activate(t);
+  bootTab(t, cmd);
+  return t;
+}
+
+async function bootTab(t, cmd){
+  const term = t.term, stdinBuffer = t.stdinBuffer;
+  const err = m => term.write("\r\n\x1b[38;5;210m"+m+"\x1b[0m\r\n");
+  if (!coiOk){
+    err("no cross-origin isolation: fork() runs on threads, which need SharedArrayBuffer.");
+    err("reload the page once (the COI service worker adds the headers on the first load).");
+    return;
+  }
+  let tar;
+  try { tar = await getRootfs(); } catch(e){ err("could not load rootfs.tar (" + e.message + "): build it with make rootfs, or download it from the release."); return; }
+  // bash reads the banner rc during init (--rcfile) and busybox ash via $ENV, so
+  // the rc's `clear` wipes bash/ash's job-control warnings ("cannot set terminal
+  // process group" / "can't access tty") in the same startup burst, before the
+  // prompt — no ugly flash, no 250ms delayed source.
+  const argv = cmd==="busybox"
+    ? ["/bin/busybox","sh"]
+    : ["/bin/bash","--noprofile","--rcfile","/root/.bloprc","-i"];
+
+  const mod = {
+    locateFile: (p)=> p.endsWith(".wasm") ? ("blink.threads.wasm?v="+ASSET_V) : p,
+    arguments: argv,
+    print:    l => term.write(l + "\r\n"),
+    printErr: l => term.write(l + "\r\n"),
+    preRun: [function(){
+      const FS = mod.FS, TTY = mod.TTY, ENV = mod.ENV;
+      untar(tar, FS);
+      installApplets(FS);
+      writeProcStatic(FS);
+      try { FS.writeFile("/root/.bloprc", BANNER_RC); } catch(e){}
+      const ICANON = 0x2, ECHO = 0x8, VMIN = 6;
+      let termios = { c_iflag:25856, c_oflag:5, c_cflag:191, c_lflag:35387,
+        c_cc:[3,28,127,21,4,0,1,0,17,19,26,0,18,15,23,22,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] };
+      const ops = {
+        get_char: () => {
+          // undefined blocks the read; null ends it, which is what a raw mode
+          // read with VMIN=0 does when there's nothing (btop drains input so)
+          if (!stdinBuffer.length)
+            return (termios.c_lflag & ICANON) || termios.c_cc[VMIN] ? undefined : null;
+          const ch = stdinBuffer.shift();
+          if (termios.c_lflag & ECHO){
+            if (ch === 13 || ch === 10) term.write("\r\n");
+            else if (ch === 127 || ch === 8) term.write("\b \b");
+            else if (ch >= 32) term.write(String.fromCharCode(ch));
+          }
+          return ch;
+        },
+        put_char: (tty,val) => term.write(new Uint8Array([val])),
+        flush: ()=>{}, fsync: ()=>{},
+        poll: () => stdinBuffer.length>0 ? (1|4) : 4,
+        ioctl_tcgets: () => termios,
+        ioctl_tcsets: (tty, opt, data) => { termios = data; return 0; },
+        ioctl_tiocgwinsz: () => [term.rows || 24, term.cols || 80],   // guest reads the live size
+      };
+      TTY.register(FS.makedev(5,0), ops); TTY.register(FS.makedev(6,0), ops);
+      FS.devices[FS.makedev(5,0)].stream_ops.poll = ops.poll;
+      FS.devices[FS.makedev(6,0)].stream_ops.poll = ops.poll;
+      ENV.TERM="xterm-256color"; ENV.HOME="/root"; ENV.PATH="/bin:/usr/bin"; ENV.PS1="blop:\\w\\$ ";
+      ENV.ENV="/root/.bloprc";   // busybox ash sources $ENV on interactive startup
+      try { FS.chdir("/root"); } catch(e){}
+    }],
+  };
+
+  await loadBlink();
+  let inst;
+  try { inst = await createBlink(mod); }
+  catch(e){ err("init blink: "+e); return; }
+  t.inst = inst;
+  if (activeTab===t) term.focus();
+  try { inst.callMain(argv); } catch(e){ /* exit -> ExitStatus, normal */ }
+}
+
+// keep the active tab sized to the glass (window resize, rotation, panel changes)
+addEventListener("resize", ()=>fit(activeTab));
+try { new ResizeObserver(()=>fit(activeTab)).observe(termsEl); } catch(e){}
+addEventListener("click", ()=>{ if (activeTab) activeTab.term.focus(); });
+newtab.addEventListener("click", ()=>newTab("bash"));
+
+newTab(CMD0);     // first shell
+</script>
+</body></html>

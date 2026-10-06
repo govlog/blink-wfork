@@ -1,0 +1,251 @@
+From fd7bc9aed83ae35e48cb227538125acbe26c8c00 Mon Sep 17 00:00:00 2001
+From: Christopher AMIAUD <christopher.amiaud@gmail.com>
+Date: Mon, 5 Oct 2026 10:12:54 +0200
+Subject: [PATCH 1/9] Fix host page tracking in non-linear memory mode
+
+When guest memory can't be mapped linearly (blink -m, WebAssembly),
+a page table entry names its host page by a slot in g_hostpages.
+This had three problems:
+
+- HandlePageFault() freed the slot number as if it were a pointer
+  when it lost the race to install a page
+- recycled pages were tracked again, so the table grew with every
+  page allocation for the life of the process
+- TrackHostPage() didn't hold a lock, and its realloc() could move
+  the table under FindHostPage(), which reads it without one
+
+Recycled pages now keep their slot, and the table grows in chunks
+that never move, under a leaf lock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ blink/machine.h      | 13 ++++++----
+ blink/memory.c       |  2 +-
+ blink/memorymalloc.c | 61 ++++++++++++++++++++++++--------------------
+ 3 files changed, 43 insertions(+), 33 deletions(-)
+
+diff --git a/blink/machine.h b/blink/machine.h
+index be17a8a..55681c6 100644
+--- a/blink/machine.h
++++ b/blink/machine.h
+@@ -161,14 +161,16 @@ struct FreeList {
+ };
+ 
+ struct HostPage {
+-  u8 *page;
++  u64 entry;  // as returned by TrackHostPage()
+   struct HostPage *next;
+ };
+ 
++#define kHostPageChunk     4096
++#define kMaxHostPageChunks 4096
++
+ struct HostPages {
+   size_t n;
+-  size_t c;
+-  u8 **p;
++  u8 **p[kMaxHostPageChunks];  // chunks never move once allocated
+ };
+ 
+ struct PageLock {
+@@ -482,7 +484,7 @@ int LoadInstruction2(struct Machine *, u64);
+ void ExecuteInstruction(struct Machine *);
+ u64 AllocatePageTable(struct System *);
+ u64 AllocateAnonymousPage(struct System *);
+-void FreeAnonymousPage(struct System *, u8 *);
++void FreeAnonymousPage(struct System *, u64);
+ u64 FindPageTableEntry(struct Machine *, u64);
+ bool CheckMemoryInvariants(struct System *) nosideeffect dontdiscard;
+ i64 ReserveVirtual(struct System *, i64, i64, u64, int, i64, bool, bool);
+@@ -842,7 +844,8 @@ static inline u8 *FindHostPage(u64 entry) {
+   if (HasLinearMapping()) {
+     return (u8 *)(uintptr_t)(entry & PAGE_TA);
+   } else {
+-    return g_hostpages.p[(entry & PAGE_TA) >> 12];
++    u64 i = (entry & PAGE_TA) >> 12;
++    return g_hostpages.p[i / kHostPageChunk][i % kHostPageChunk];
+   }
+ }
+ 
+diff --git a/blink/memory.c b/blink/memory.c
+index 6c2d34c..0c71e9a 100644
+--- a/blink/memory.c
++++ b/blink/memory.c
+@@ -103,7 +103,7 @@ u64 HandlePageFault(struct Machine *m, u8 *pslot, u64 entry) {
+         m->system->memstat.reserved -= 1;
+         entry = x;
+       } else {
+-        FreeAnonymousPage(m->system, (u8 *)(uintptr_t)(page & PAGE_TA));
++        FreeAnonymousPage(m->system, page);
+         entry = LoadPte(pslot);
+         m->system->rss -= 1;
+       }
+diff --git a/blink/memorymalloc.c b/blink/memorymalloc.c
+index 7d5cc93..f40106b 100644
+--- a/blink/memorymalloc.c
++++ b/blink/memorymalloc.c
+@@ -52,6 +52,7 @@ struct Allocator {
+ 
+ struct Machine g_bssmachine;
+ struct HostPages g_hostpages;
++static pthread_mutex_t_ g_hostpages_lock = PTHREAD_MUTEX_INITIALIZER_;
+ 
+ static void FillPage(void *p, int c) {
+   memset(p, c, 4096);
+@@ -69,28 +70,33 @@ static void FreeHostPage(struct HostPage *hp) {
+   free(hp);
+ }
+ 
++// pages are tracked once and keep their slot when recycled. threads
++// may track pages concurrently, but FindHostPage() reads without lock
++// which is safe because slots are never moved after being handed out
+ static u64 TrackHostPage(u8 *ptr) {
+-  u64 entry;
++  u64 i;
++  u8 **chunk;
+   if (HasLinearMapping()) {
+     return (uintptr_t)ptr;
+   } else {
+-    if (g_hostpages.n == g_hostpages.c) {
+-      g_hostpages.c += 1;
+-      g_hostpages.c += g_hostpages.c >> 1;
+-      g_hostpages.p =
+-          realloc(g_hostpages.p, g_hostpages.c * sizeof(*g_hostpages.p));
++    LOCK(&g_hostpages_lock);
++    i = g_hostpages.n++;
++    unassert(i / kHostPageChunk < kMaxHostPageChunks);
++    if (!(chunk = g_hostpages.p[i / kHostPageChunk])) {
++      unassert((chunk = (u8 **)malloc(kHostPageChunk * sizeof(*chunk))));
++      g_hostpages.p[i / kHostPageChunk] = chunk;
+     }
+-    entry = g_hostpages.n++;
+-    g_hostpages.p[entry] = ptr;
+-    return entry << 12;
++    chunk[i % kHostPageChunk] = ptr;
++    UNLOCK(&g_hostpages_lock);
++    return i << 12;
+   }
+ }
+ 
+-void FreeAnonymousPage(struct System *s, u8 *page) {
++void FreeAnonymousPage(struct System *s, u64 entry) {
+   struct HostPage *h;
+   unassert((h = NewHostPage()));
+   LOCK(&g_allocator.lock);
+-  h->page = page;
++  h->entry = entry & PAGE_TA;
+   h->next = g_allocator.pages;
+   g_allocator.pages = h;
+   UNLOCK(&g_allocator.lock);
+@@ -120,8 +126,8 @@ void *AllocateBig(size_t n, int prot, int flags, int fd, off_t off) {
+   return p != MAP_FAILED ? p : 0;
+ }
+ 
+-static void FreePageTable(struct System *s, u8 *page) {
+-  FreeAnonymousPage(s, page);
++static void FreePageTable(struct System *s, u64 entry) {
++  FreeAnonymousPage(s, entry);
+   s->memstat.tables -= 1;
+   s->rss -= 1;
+ }
+@@ -129,6 +135,7 @@ static void FreePageTable(struct System *s, u8 *page) {
+ static bool FreeEmptyPageTables(struct System *s, u64 pt, long level) {
+   u8 *mi;
+   long i;
++  u64 pte;
+   bool isempty = true;
+   mi = GetPageAddress(s, pt, level == 1);
+   for (i = 0; i < 512; ++i) {
+@@ -137,20 +144,20 @@ static bool FreeEmptyPageTables(struct System *s, u64 pt, long level) {
+         isempty = false;
+       }
+     } else {
+-      pt = LoadPte(mi + i * 8);
+-      if (pt & PAGE_V) {
+-        if (FreeEmptyPageTables(s, pt, level + 1)) {
++      pte = LoadPte(mi + i * 8);
++      if (pte & PAGE_V) {
++        if (FreeEmptyPageTables(s, pte, level + 1)) {
+           StorePte(mi + i * 8, 0);
+         } else {
+           isempty = false;
+         }
+       } else {
+-        unassert(!pt);
++        unassert(!pte);
+       }
+     }
+   }
+   if (isempty) {
+-    FreePageTable(s, mi);
++    FreePageTable(s, pt);
+   }
+   return isempty;
+ }
+@@ -451,12 +458,13 @@ void FreeMachine(struct Machine *m) {
+ u64 AllocateAnonymousPage(struct System *s) {
+   u8 *page;
+   size_t i, n;
++  u64 entry;
+   struct HostPage *h;
+   LOCK(&g_allocator.lock);
+   if ((h = g_allocator.pages)) {
+     g_allocator.pages = h->next;
+     UNLOCK(&g_allocator.lock);
+-    page = h->page;
++    entry = h->entry;
+     FreeHostPage(h);
+     goto Finished;
+   } else {
+@@ -469,16 +477,16 @@ u64 AllocateAnonymousPage(struct System *s) {
+   LOCK(&g_allocator.lock);
+   for (i = n; i-- > 1;) {
+     unassert((h = NewHostPage()));
+-    h->page = page + i * 4096;
++    h->entry = TrackHostPage(page + i * 4096);
+     h->next = g_allocator.pages;
+     g_allocator.pages = h;
+   }
+   UNLOCK(&g_allocator.lock);
++  entry = TrackHostPage(page);
+ Finished:
+   s->rss += 1;
+-  i = TrackHostPage(page);
+-  unassert(!(i & ~PAGE_TA));
+-  return i | PAGE_HOST | PAGE_U | PAGE_RW | PAGE_V;
++  unassert(!(entry & ~PAGE_TA));
++  return entry | PAGE_HOST | PAGE_U | PAGE_RW | PAGE_V;
+ }
+ 
+ u64 AllocatePageTable(struct System *s) {
+@@ -624,7 +632,6 @@ static void WaitForPageToNotBeLocked(struct System *s, i64 virt, u8 *pte) {
+ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
+                      bool *executable_code_was_made_non_executable,
+                      long *rss_delta) {
+-  u8 *page;
+   long pagesize;
+   unassert(entry & PAGE_V);
+   if (entry & PAGE_FILE) UnmarkFilePage(s, virt);
+@@ -639,8 +646,8 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
+   if ((entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG)) == PAGE_HOST) {
+     unassert(~entry & PAGE_RSRV);
+     s->memstat.committed -= 1;
+-    ClearPage((page = FindHostPage(entry)));
+-    FreeAnonymousPage(s, page);
++    ClearPage(FindHostPage(entry));
++    FreeAnonymousPage(s, entry);
+     --*rss_delta;
+     return false;
+   } else if ((entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG)) ==
+@@ -749,7 +756,7 @@ static void RemoveVirtual(struct System *s, i64 virt, i64 size,
+         // crawl an old pointer to a free page table. free page
+         // tables may be crawled because they always get zero'd
+         // before being put into a freelist fifo that cools off
+-        FreePageTable(s, GetPageAddress(s, LoadPte(pde), i == 39));
++        FreePageTable(s, LoadPte(pde));
+         StorePte(pde, 0);
+       }
+       break;
+-- 
+2.53.0
+

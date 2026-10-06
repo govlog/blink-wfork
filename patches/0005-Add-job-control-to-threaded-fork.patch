@@ -1,0 +1,719 @@
+From fd16e178e2caaf217b9f1f6abd00494b4a2f115f Mon Sep 17 00:00:00 2001
+From: Christopher AMIAUD <christopher.amiaud@gmail.com>
+Date: Mon, 5 Oct 2026 10:41:53 +0200
+Subject: [PATCH 5/9] Add job control to threaded fork()
+
+kill(), getppid(), process groups and the terminal's foreground group
+now come from the table of processes, so a shell can manage jobs:
+kill %1, ^Z then fg or bg, kill 0. A stop signal suspends the thread
+of the process until SIGCONT or SIGKILL, wait4() reports stops and
+continues, and the parent gets SIGCHLD.
+
+Since a process is signalled without a host signal, blocking pipe
+reads and writes, tty reads and nanosleep() look for pending signals
+at least every 100ms.
+
+On emscripten the page draws the terminal, so the page reads ^C, ^Z
+and ^\ too: blink_tty_isig() tells whether the terminal is in cooked
+mode, and blink_tty_signal() sends a signal to the foreground process
+group.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ blink/blink.c      |  20 ++-
+ blink/ioctl.c      |  18 ++-
+ blink/pipe.c       |  26 +++-
+ blink/syscall.c    |  27 ++++
+ blink/threadfork.c | 318 ++++++++++++++++++++++++++++++++++++---------
+ blink/threadfork.h |  10 ++
+ 6 files changed, 346 insertions(+), 73 deletions(-)
+
+diff --git a/blink/blink.c b/blink/blink.c
+index 741fef0..ea9ad3e 100644
+--- a/blink/blink.c
++++ b/blink/blink.c
+@@ -151,6 +151,13 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
+   int syssig;
+   struct sigaction sa;
+   unassert(!IsSignalIgnoredByDefault(sig));
++#ifdef HAVE_THREADED_FORK
++  if (sig == SIGSTOP_LINUX || sig == SIGTSTP_LINUX ||  //
++      sig == SIGTTIN_LINUX || sig == SIGTTOU_LINUX) {
++    StopProcess(m, sig);  // there's no host process to stop
++    return;
++  }
++#endif
+   KillOtherThreads(m->system);
+ #ifdef HAVE_JIT
+   DisableJit(&m->system->jit);  // unmapping exec pages is slow
+@@ -217,10 +224,15 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
+ #endif
+   m->system->exec = Exec;
+ #ifdef HAVE_THREADED_FORK
+-  if (old && old->system->isfork) {
+-    // a child process of threaded fork() keeps its pid across execve()
+-    m->system->isfork = true;
+-    m->system->pid = m->tid = old->system->pid;
++  if (!old) {
++    AddMainProcess(m);
++  } else {
++    if (old->system->isfork) {
++      // a child process of threaded fork() keeps its pid across execve()
++      m->system->isfork = true;
++      m->system->pid = m->tid = old->system->pid;
++    }
++    SetProcessMachine(m->system->pid, m);
+   }
+ #endif
+   if (!old) {
+diff --git a/blink/ioctl.c b/blink/ioctl.c
+index f223a12..54e08ee 100644
+--- a/blink/ioctl.c
++++ b/blink/ioctl.c
+@@ -39,6 +39,7 @@
+ #include "blink/ndelay.h"
+ #include "blink/syscall.h"
+ #include "blink/thread.h"
++#include "blink/threadfork.h"
+ #include "blink/types.h"
+ #include "blink/vfs.h"
+ #include "blink/xlat.h"
+@@ -83,17 +84,26 @@ static int IoctlTcgets(struct Machine *m, int fd, i64 addr,
+ 
+ static int IoctlTcsets(struct Machine *m, int fd, int request, i64 addr,
+                        int fn(int, int, const struct termios *)) {
++  int rc;
+   struct termios tio;
+   struct termios_linux gtio;
+   if (CopyFromUserRead(m, &gtio, addr, sizeof(gtio)) == -1) return -1;
+   XlatLinuxToTermios(&tio, &gtio);
+-  return fn(fd, request, &tio);
++  rc = fn(fd, request, &tio);
++#ifdef HAVE_THREADED_FORK
++  if (rc != -1) SetTtyIsig(tio.c_lflag & ISIG);
++#endif
++  return rc;
+ }
+ 
+ static int IoctlTiocgpgrp(struct Machine *m, int fd, i64 addr) {
+   int rc;
+   u8 *pgrp;
+-#ifdef __EMSCRIPTEN__
++#ifdef HAVE_THREADED_FORK
++  if (!(pgrp = (u8 *)SchlepW(m, addr, 4))) return -1;
++  Write32(pgrp, GetForegroundGroup());
++  return 0;
++#elif defined(__EMSCRIPTEN__)
+   // Force shells to disable job control in emscripten
+   errno = ENOTTY;
+   return -1;
+@@ -107,6 +117,10 @@ static int IoctlTiocgpgrp(struct Machine *m, int fd, i64 addr) {
+ static int IoctlTiocspgrp(struct Machine *m, int fd, i64 addr) {
+   u8 *pgrp;
+   if (!(pgrp = (u8 *)SchlepR(m, addr, 4))) return -1;
++#ifdef HAVE_THREADED_FORK
++  SetForegroundGroup(Read32(pgrp));
++  return 0;
++#endif
+   return VfsTcsetpgrp(fd, Read32(pgrp));
+ }
+ 
+diff --git a/blink/pipe.c b/blink/pipe.c
+index e1c7ea0..5f396d6 100644
+--- a/blink/pipe.c
++++ b/blink/pipe.c
+@@ -35,6 +35,7 @@
+ #include "blink/ndelay.h"
+ #include "blink/syscall.h"
+ #include "blink/thread.h"
++#include "blink/timespec.h"
+ #include "blink/vfs.h"
+ #include "blink/xlat.h"
+ 
+@@ -70,6 +71,15 @@ static struct Pipe *GetPipe(int handle) {
+   return g_pipes.p + ((handle & ~kPipeHandle) >> 1);
+ }
+ 
++// waits for the pipe to change, or returns false if a signal arrives.
++// other processes signal us without a host signal to interrupt this.
++static bool WaitPipe(struct Pipe *p) {
++  struct timespec deadline;
++  deadline = AddTime(GetTime(), FromMilliseconds(100));
++  pthread_cond_timedwait(&p->cond, &g_pipes.lock, &deadline);
++  return !(g_machine->signals & ~g_machine->sigmask);
++}
++
+ static int OpenPipe(int handles[2]) {
+   int i;
+   u8 *buf;
+@@ -127,14 +137,18 @@ static int ClosePipe(int handle) {
+   return 0;
+ }
+ 
+-// blocks until there's data, or returns 0 once every writer is closed
++// blocks until there's data, or returns 0 once every writer is closed,
++// or fails with EINTR if a signal arrives
+ static ssize_t ReadPipe(int handle, const struct iovec *iov, int iovcnt) {
+   int i;
+   size_t n, off, got = 0;
+   struct Pipe *p = GetPipe(handle);
+   LOCK(&g_pipes.lock);
+   while (!p->len && p->writers) {
+-    unassert(!pthread_cond_wait(&p->cond, &g_pipes.lock));
++    if (!WaitPipe(p)) {
++      UNLOCK(&g_pipes.lock);
++      return eintr();
++    }
+   }
+   for (i = 0; i < iovcnt && p->len; ++i) {
+     for (off = 0; off < iov[i].iov_len && p->len; off += n) {
+@@ -151,7 +165,8 @@ static ssize_t ReadPipe(int handle, const struct iovec *iov, int iovcnt) {
+ }
+ 
+ // blocks until everything is written, or fails with EPIPE once every
+-// reader is closed, in which case a partial write is reported as such
++// reader is closed, or with EINTR if a signal arrives, unless some was
++// written already, in which case that partial write is returned
+ static ssize_t WritePipe(int handle, const struct iovec *iov, int iovcnt) {
+   int i;
+   size_t n, off, tail, put = 0;
+@@ -160,7 +175,10 @@ static ssize_t WritePipe(int handle, const struct iovec *iov, int iovcnt) {
+   for (i = 0; i < iovcnt; ++i) {
+     for (off = 0; off < iov[i].iov_len; off += n) {
+       while (p->len == kPipeSize && p->readers) {
+-        unassert(!pthread_cond_wait(&p->cond, &g_pipes.lock));
++        if (!WaitPipe(p)) {
++          UNLOCK(&g_pipes.lock);
++          return put ? put : eintr();
++        }
+       }
+       if (!p->readers) {
+         UNLOCK(&g_pipes.lock);
+diff --git a/blink/syscall.c b/blink/syscall.c
+index d715701..42909fb 100644
+--- a/blink/syscall.c
++++ b/blink/syscall.c
+@@ -175,6 +175,10 @@ ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
+   if (VfsFcntl(fd, F_GETFL, 0) & O_NONBLOCK) return VfsReadv(fd, iov, iovcnt);
+   while ((rc = VfsReadv(fd, iov, iovcnt)) == -1 && errno == EAGAIN) {
+     EmYield(50);
++    // other processes signal us without a host signal to interrupt this
++    if (g_machine && (g_machine->signals & ~g_machine->sigmask)) {
++      return eintr();
++    }
+   }
+   return rc;
+ #else
+@@ -601,6 +605,7 @@ static int ThreadFork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
+     FreeMachine(m2);
+     return -1;
+   }
++  SetProcessMachine(pid, m2);
+   m2->tid = pid;
+   ResetTlb(m2);
+   Put64(m2->ax, 0);
+@@ -4161,8 +4166,15 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
+   for (;;) {
+     if (CompareTime(now, deadline) >= 0) return 0;
+     ts = SubtractTime(deadline, now);
++#ifdef HAVE_THREADED_FORK
++    // other processes signal us without a host signal to interrupt this
++    if (CompareTime(ts, FromMilliseconds(100)) > 0) ts = FromMilliseconds(100);
++    nanosleep(&ts, 0);
++    if (m->signals & ~m->sigmask) {
++#else
+     if (nanosleep(&ts, 0)) {
+       unassert(errno == EINTR);
++#endif
+       // this may run a guest signal handler before returning
+       if (CheckInterrupt(m, false)) {
+         // a signal was delivered or is about to be delivered
+@@ -5105,6 +5117,9 @@ static int SysSigpending(struct Machine *m, i64 setaddr) {
+ }
+ 
+ static int SysKill(struct Machine *m, int pid, int sig) {
++#ifdef HAVE_THREADED_FORK
++  return KillProcess(m, pid, sig);
++#endif
+   return kill(pid, sig ? XlatSignal(sig) : 0);
+ }
+ 
+@@ -5229,6 +5244,9 @@ static int SysGettid(struct Machine *m) {
+ }
+ 
+ static int SysGetppid(struct Machine *m) {
++#ifdef HAVE_THREADED_FORK
++  return GetParentProcess(m);
++#endif
+   return getppid();
+ }
+ 
+@@ -5438,10 +5456,16 @@ static int SysSetgid(struct Machine *m, int gid) {
+ }
+ 
+ static int SysGetpgid(struct Machine *m, int pid) {
++#ifdef HAVE_THREADED_FORK
++  return GetProcessGroup(m, pid);
++#endif
+   return getpgid(pid);
+ }
+ 
+ static int SysGetpgrp(struct Machine *m) {
++#ifdef HAVE_THREADED_FORK
++  return GetProcessGroup(m, 0);
++#endif
+   return getpgid(0);
+ }
+ 
+@@ -5450,6 +5474,9 @@ static int SysAlarm(struct Machine *m, unsigned seconds) {
+ }
+ 
+ static int SysSetpgid(struct Machine *m, int pid, int gid) {
++#ifdef HAVE_THREADED_FORK
++  return SetProcessGroup(m, pid, gid);
++#endif
+   return setpgid(pid, gid);
+ }
+ 
+diff --git a/blink/threadfork.c b/blink/threadfork.c
+index 2f1d750..e283d17 100644
+--- a/blink/threadfork.c
++++ b/blink/threadfork.c
+@@ -31,16 +31,22 @@
+ #include "blink/linux.h"
+ #include "blink/log.h"
+ #include "blink/machine.h"
++#include "blink/macros.h"
++#include "blink/signal.h"
+ #include "blink/vfs.h"
+ #include "blink/xlat.h"
+ 
+ #ifdef HAVE_THREADED_FORK
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
+ 
+ // Threaded fork() for hosts that can't fork(), e.g. WebAssembly
+ //
+ // The child process runs on a new thread, with its own System, whose
+ // address space and file descriptors are copies of the parent's. This
+-// file keeps the table of those children, so wait4() can reap them.
++// file keeps the table of processes, so wait4() can reap children, and
++// so kill() and job control can reach them without a host signal.
+ //
+ // Since all guest processes now share the host's file descriptors, it
+ // implies HAVE_VIRTUAL_FDS. It also needs non-linear memory, to let a
+@@ -48,66 +54,124 @@
+ //
+ // TODO: Stop the other threads of a child process when it exits.
+ 
+-struct Child {
+-  struct Child *next;
++struct Proc {
++  struct Proc *next;
+   int pid;
+   int ppid;
++  int pgid;
+   int wstatus;
+-  bool zombie;
++  bool zombie;   // exited, and waiting for wait4()
++  bool stopped;  // stopped, and waiting for SIGCONT
++  bool changed;  // stopped or continued since the last wait4()
+   pthread_t thread;
+-  struct Machine *m;  // set on exit, then freed by the reaper
++  struct Machine *m;  // changes on execve()
+ };
+ 
+-static struct Children {
++static struct Procs {
+   pthread_mutex_t_ lock;
+   pthread_cond_t_ cond;
+-  struct Child *list;
++  struct Proc *list;
+   int lastpid;
+-} g_children = {
++  int fgpgid;  // foreground process group of the terminal
++  bool isig;   // whether the terminal turns ^C ^Z ^\ into signals
++} g_procs = {
+     PTHREAD_MUTEX_INITIALIZER_,
+     PTHREAD_COND_INITIALIZER,
+ };
+ 
+-static struct Child *FindChild(int pid) {
+-  struct Child *c;
+-  for (c = g_children.list; c; c = c->next) {
+-    if (c->pid == pid) break;
++static struct Proc *FindProc(int pid) {
++  struct Proc *p;
++  for (p = g_procs.list; p; p = p->next) {
++    if (p->pid == pid) break;
+   }
+-  return c;
++  return p;
++}
++
++static int GetPgid(int pid) {
++  struct Proc *p;
++  return (p = FindProc(pid)) ? p->pgid : pid;
++}
++
++static void Signal(struct Proc *p, int sig) {
++  if (p->zombie) return;
++  if (sig == SIGCONT_LINUX || sig == SIGKILL_LINUX) {
++    if (p->stopped) {
++      p->stopped = false;
++      if (sig == SIGCONT_LINUX) {
++        p->changed = true;
++        p->wstatus = 0xffff;  // WIFCONTINUED
++      }
++      unassert(!pthread_cond_broadcast(&g_procs.cond));
++    }
++  }
++  EnqueueSignal(p->m, sig);
++}
++
++static void NotifyParent(struct Proc *p) {
++  struct Proc *parent;
++  if ((parent = FindProc(p->ppid))) Signal(parent, SIGCHLD_LINUX);
++  unassert(!pthread_cond_broadcast(&g_procs.cond));
++}
++
++void AddMainProcess(struct Machine *m) {
++  struct Proc *p;
++  unassert((p = (struct Proc *)calloc(1, sizeof(*p))));
++  p->pid = p->pgid = m->system->pid;
++  p->m = m;
++  LOCK(&g_procs.lock);
++  p->next = g_procs.list;
++  g_procs.list = p;
++  g_procs.lastpid = MAX(g_procs.lastpid, p->pid);
++  g_procs.fgpgid = p->pgid;
++  UNLOCK(&g_procs.lock);
+ }
+ 
+ // registers child system `s` of process `ppid` and assigns its pid
+ int AddChildProcess(struct System *s, int ppid) {
+-  struct Child *c;
+-  if (!(c = (struct Child *)calloc(1, sizeof(*c)))) return enomem();
+-  LOCK(&g_children.lock);
+-  if (!g_children.lastpid) g_children.lastpid = getpid();
+-  c->pid = s->pid = ++g_children.lastpid;
+-  c->ppid = ppid;
+-  c->next = g_children.list;
+-  g_children.list = c;
+-  UNLOCK(&g_children.lock);
+-  return c->pid;
++  struct Proc *p, *parent;
++  if (!(p = (struct Proc *)calloc(1, sizeof(*p)))) return enomem();
++  LOCK(&g_procs.lock);
++  p->pid = s->pid = ++g_procs.lastpid;
++  p->ppid = ppid;
++  p->pgid = (parent = FindProc(ppid)) ? parent->pgid : p->pid;
++  p->next = g_procs.list;
++  g_procs.list = p;
++  UNLOCK(&g_procs.lock);
++  return p->pid;
+ }
+ 
+ void RemoveChildProcess(int pid) {
+-  struct Child **p, *c;
+-  LOCK(&g_children.lock);
+-  for (p = &g_children.list; (c = *p); p = &c->next) {
+-    if (c->pid == pid) {
+-      *p = c->next;
+-      free(c);
++  struct Proc **pp, *p;
++  LOCK(&g_procs.lock);
++  for (pp = &g_procs.list; (p = *pp); pp = &p->next) {
++    if (p->pid == pid) {
++      *pp = p->next;
++      free(p);
+       break;
+     }
+   }
+-  UNLOCK(&g_children.lock);
++  UNLOCK(&g_procs.lock);
++}
++
++// called when the process `pid` gets machine `m`, i.e. on execve(),
++// whose pending signals must survive, since Signal() may have raced it
++void SetProcessMachine(int pid, struct Machine *m) {
++  struct Proc *p;
++  LOCK(&g_procs.lock);
++  if ((p = FindProc(pid))) {
++    if (p->m && (m->signals |= p->m->signals)) {
++      atomic_store_explicit(&m->attention, true, memory_order_release);
++    }
++    p->m = m;
++  }
++  UNLOCK(&g_procs.lock);
+ }
+ 
+ void SetChildThread(int pid, pthread_t thread) {
+-  struct Child *c;
+-  LOCK(&g_children.lock);
+-  if ((c = FindChild(pid))) c->thread = thread;
+-  UNLOCK(&g_children.lock);
++  struct Proc *p;
++  LOCK(&g_procs.lock);
++  if ((p = FindProc(pid))) p->thread = thread;
++  UNLOCK(&g_procs.lock);
+ }
+ 
+ // ends the child process `m` belongs to with `wstatus` for wait4(). the
+@@ -116,7 +180,7 @@ void SetChildThread(int pid, pthread_t thread) {
+ _Noreturn void ExitChildProcess(struct Machine *m, int wstatus) {
+   struct Fd *fd;
+   struct Dll *e;
+-  struct Child *c;
++  struct Proc *p;
+   LOCK(&m->system->fds.lock);
+   while ((e = dll_first(m->system->fds.list))) {
+     dll_remove(&m->system->fds.list, e);
+@@ -129,61 +193,189 @@ _Noreturn void ExitChildProcess(struct Machine *m, int wstatus) {
+     FreeFd(fd);
+   }
+   UNLOCK(&m->system->fds.lock);
+-  LOCK(&g_children.lock);
+-  if ((c = FindChild(m->system->pid))) {
+-    c->m = m;
+-    c->wstatus = wstatus;
+-    c->zombie = true;
+-  }
+-  unassert(!pthread_cond_broadcast(&g_children.cond));
+-  UNLOCK(&g_children.lock);
++  LOCK(&g_procs.lock);
++  if ((p = FindProc(m->system->pid))) {
++    p->m = m;
++    p->wstatus = wstatus;
++    p->zombie = true;
++    NotifyParent(p);
++  }
++  UNLOCK(&g_procs.lock);
+   pthread_exit(0);
+ }
+ 
++// suspends the process `m` belongs to until it gets SIGCONT or SIGKILL
++void StopProcess(struct Machine *m, int sig) {
++  struct Proc *p;
++  LOCK(&g_procs.lock);
++  if ((p = FindProc(m->system->pid)) && p->ppid) {
++    p->stopped = true;
++    p->changed = true;
++    p->wstatus = sig << 8 | 0x7f;  // WIFSTOPPED
++    NotifyParent(p);
++    while (p->stopped) {
++      unassert(!pthread_cond_wait(&g_procs.cond, &g_procs.lock));
++    }
++  }
++  UNLOCK(&g_procs.lock);
++}
++
+ int WaitChildProcess(struct Machine *m, int pid, i64 wstatusaddr, int options,
+                      i64 rusageaddr) {
+-  int rc;
+-  bool any;
+   u8 gwstatus[4];
+-  struct Child **p, *c;
++  bool any, reap;
++  struct Proc **pp, *p;
+   struct rusage_linux gru;
++  int rc, ws, pgid, self = m->system->pid;
+   if ((options = XlatWait(options)) == -1) return -1;
+   if ((wstatusaddr &&
+        !IsValidMemory(m, wstatusaddr, sizeof(gwstatus), PROT_WRITE)) ||
+       (rusageaddr && !IsValidMemory(m, rusageaddr, sizeof(gru), PROT_WRITE))) {
+     return -1;
+   }
+-  LOCK(&g_children.lock);
++  LOCK(&g_procs.lock);
++  pgid = pid < -1 ? -pid : pid == 0 ? GetPgid(self) : 0;
+   for (;;) {
+     any = false;
+-    for (p = &g_children.list; (c = *p); p = &c->next) {
+-      if (c->ppid != m->system->pid) continue;
+-      if (pid > 0 && c->pid != pid) continue;
++    for (pp = &g_procs.list; (p = *pp); pp = &p->next) {
++      if (p->ppid != self) continue;
++      if (pid > 0 && p->pid != pid) continue;
++      if (pgid && p->pgid != pgid) continue;
+       any = true;
+-      if (c->zombie) {
+-        *p = c->next;
++      if (p->zombie) {
++        *pp = p->next;
++        break;
++      }
++      if (p->changed && ((p->stopped && (options & WUNTRACED)) ||
++                         (!p->stopped && (options & WCONTINUED)))) {
++        p->changed = false;
+         break;
+       }
+     }
+-    if (c || !any || (options & WNOHANG)) break;
+-    pthread_cond_wait(&g_children.cond, &g_children.lock);
+-  }
+-  UNLOCK(&g_children.lock);
+-  if (!c) return any ? 0 : echild();
+-  // the thread may still be unwinding after it marked itself a zombie
+-  unassert(!pthread_join(c->thread, 0));
+-  FreeMachine(c->m);
++    if (p || !any || (options & WNOHANG)) break;
++    unassert(!pthread_cond_wait(&g_procs.cond, &g_procs.lock));
++  }
++  if (p) {
++    rc = p->pid;
++    ws = p->wstatus;
++    reap = p->zombie;
++  }
++  UNLOCK(&g_procs.lock);
++  if (!p) return any ? 0 : echild();
++  if (reap) {
++    // the thread may still be unwinding after it marked itself a zombie
++    unassert(!pthread_join(p->thread, 0));
++    FreeMachine(p->m);
++    free(p);
++  }
+   if (wstatusaddr) {
+-    Write32(gwstatus, c->wstatus);
++    Write32(gwstatus, ws);
+     CopyToUserWrite(m, wstatusaddr, gwstatus, sizeof(gwstatus));
+   }
+   if (rusageaddr) {
+     memset(&gru, 0, sizeof(gru));
+     CopyToUserWrite(m, rusageaddr, &gru, sizeof(gru));
+   }
+-  rc = c->pid;
+-  free(c);
+   return rc;
+ }
+ 
++// returns true if kill(pid) from process `self` reaches process `p`
++static bool IsKillTarget(struct Proc *p, int pid, int self) {
++  if (pid > 0) return p->pid == pid;
++  if (pid == -1) return p->pid != self && p->ppid;
++  return p->pgid == -pid;
++}
++
++int KillProcess(struct Machine *m, int pid, int sig) {
++  bool any;
++  struct Proc *p;
++  int self = m->system->pid;
++  if (!(0 <= sig && sig <= 64)) return einval();
++  LOCK(&g_procs.lock);
++  if (!pid) pid = -GetPgid(self);
++  for (any = false, p = g_procs.list; p; p = p->next) {
++    if (IsKillTarget(p, pid, self)) {
++      any = true;
++      if (sig) Signal(p, sig);
++    }
++  }
++  UNLOCK(&g_procs.lock);
++  return any ? 0 : esrch();
++}
++
++int GetParentProcess(struct Machine *m) {
++  int ppid;
++  struct Proc *p;
++  LOCK(&g_procs.lock);
++  ppid = (p = FindProc(m->system->pid)) ? p->ppid : 0;
++  UNLOCK(&g_procs.lock);
++  return ppid;
++}
++
++int GetProcessGroup(struct Machine *m, int pid) {
++  int rc;
++  struct Proc *p;
++  LOCK(&g_procs.lock);
++  rc = (p = FindProc(pid ? pid : m->system->pid)) ? p->pgid : esrch();
++  UNLOCK(&g_procs.lock);
++  return rc;
++}
++
++int SetProcessGroup(struct Machine *m, int pid, int pgid) {
++  int rc;
++  struct Proc *p;
++  int self = m->system->pid;
++  if (pgid < 0) return einval();
++  LOCK(&g_procs.lock);
++  if (!(p = FindProc(pid ? pid : self))) {
++    rc = esrch();
++  } else if (p->pid != self && p->ppid != self) {
++    rc = esrch();
++  } else {
++    p->pgid = pgid ? pgid : p->pid;
++    rc = 0;
++  }
++  UNLOCK(&g_procs.lock);
++  return rc;
++}
++
++int GetForegroundGroup(void) {
++  int pgid;
++  LOCK(&g_procs.lock);
++  pgid = g_procs.fgpgid;
++  UNLOCK(&g_procs.lock);
++  return pgid;
++}
++
++void SetForegroundGroup(int pgid) {
++  LOCK(&g_procs.lock);
++  g_procs.fgpgid = pgid;
++  UNLOCK(&g_procs.lock);
++}
++
++void SetTtyIsig(bool isig) {
++  g_procs.isig = isig;
++}
++
++#ifdef __EMSCRIPTEN__
++// The terminal is drawn by the page, so it's the page that reads ^C ^Z
++// and ^\. It asks blink_tty_isig() whether the terminal is in cooked
++// mode, and if so calls blink_tty_signal() with the guest signal, which
++// goes to the foreground process group, rather than passing the byte.
++
++EMSCRIPTEN_KEEPALIVE int blink_tty_isig(void) {
++  return g_procs.isig;
++}
++
++EMSCRIPTEN_KEEPALIVE void blink_tty_signal(int sig) {
++  struct Proc *p;
++  if (!(1 <= sig && sig <= 64)) return;
++  LOCK(&g_procs.lock);
++  for (p = g_procs.list; p; p = p->next) {
++    if (p->pgid == g_procs.fgpgid) Signal(p, sig);
++  }
++  UNLOCK(&g_procs.lock);
++}
++#endif /* __EMSCRIPTEN__ */
++
+ #endif /* HAVE_THREADED_FORK */
+diff --git a/blink/threadfork.h b/blink/threadfork.h
+index a2ece24..07b3ceb 100644
+--- a/blink/threadfork.h
++++ b/blink/threadfork.h
+@@ -5,11 +5,21 @@
+ #include "blink/types.h"
+ #ifdef HAVE_THREADED_FORK
+ 
++void AddMainProcess(struct Machine *);
+ int AddChildProcess(struct System *, int);
+ void RemoveChildProcess(int);
++void SetProcessMachine(int, struct Machine *);
+ void SetChildThread(int, pthread_t);
+ _Noreturn void ExitChildProcess(struct Machine *, int);
++void StopProcess(struct Machine *, int);
+ int WaitChildProcess(struct Machine *, int, i64, int, i64);
++int KillProcess(struct Machine *, int, int);
++int GetParentProcess(struct Machine *);
++int GetProcessGroup(struct Machine *, int);
++int SetProcessGroup(struct Machine *, int, int);
++int GetForegroundGroup(void);
++void SetForegroundGroup(int);
++void SetTtyIsig(bool);
+ 
+ #endif /* HAVE_THREADED_FORK */
+ #endif /* BLINK_THREADFORK_H_ */
+-- 
+2.53.0
+

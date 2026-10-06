@@ -1,0 +1,992 @@
+From 405d3e9821d119185265d9bdd16e770bc3393d5a Mon Sep 17 00:00:00 2001
+From: Christopher AMIAUD <christopher.amiaud@gmail.com>
+Date: Mon, 5 Oct 2026 10:20:49 +0200
+Subject: [PATCH 2/9] Track the host fd behind each guest fd
+
+Each Fd now records the host fd it wraps, and every host call goes
+through it, instead of assuming the guest number is the host's.
+
+By default the two numbers stay equal and nothing changes. Defining
+HAVE_VIRTUAL_FDS makes blink choose the guest numbers itself (lowest
+free one, like Linux) and implement the dup family on top of a host
+dup(). That's needed when guest processes share a single host fd
+table, which is the case when fork() is emulated with threads.
+
+The mode can be tested on any host: add HAVE_VIRTUAL_FDS to config.h
+and run `make check` with some host fds held open, so host and guest
+numbers diverge.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ blink/ancillary.c    |  14 +--
+ blink/close.c        |   4 +-
+ blink/fds.c          |  34 ++++++-
+ blink/fds.h          |  16 +++-
+ blink/ioctl.c        |  11 ++-
+ blink/memorymalloc.c |   3 +
+ blink/open.c         |   5 +-
+ blink/pipe.c         |   9 +-
+ blink/syscall.c      | 224 ++++++++++++++++++++++++++++++-------------
+ blink/syscall.h      |   5 +
+ 10 files changed, 234 insertions(+), 91 deletions(-)
+
+diff --git a/blink/ancillary.c b/blink/ancillary.c
+index f9780dd..76b22c4 100644
+--- a/blink/ancillary.c
++++ b/blink/ancillary.c
+@@ -239,18 +239,21 @@ static i64 CopyCmsg(struct Machine *m, struct msghdr_linux *gm, int level,
+   return hdrspace + ROUNDUP(len, 8);
+ }
+ 
+-static void TrackScmRightsFd(struct Machine *m, int fildes, int flags) {
++static int TrackScmRightsFd(struct Machine *m, int fildes, int flags) {
+   int oflags;
++  struct Fd *fd;
+   SYS_LOGF("ReceiveScmRights(fd=%d)", fildes);
+   unassert((oflags = VfsFcntl(fildes, F_GETFL, 0)) != -1);
+-  InheritFd(AddFd(
+-      &m->system->fds, fildes,
+-      oflags | O_RDWR | (flags & MSG_CMSG_CLOEXEC_LINUX ? O_CLOEXEC : 0)));
++  unassert(fd = AddFd(&m->system->fds, fildes,
++                      oflags | O_RDWR |
++                          (flags & MSG_CMSG_CLOEXEC_LINUX ? O_CLOEXEC : 0)));
++  InheritFd(fd);
+ #ifndef MSG_CMSG_CLOEXEC
+   if (flags & MSG_CMSG_CLOEXEC_LINUX) {
+     unassert(!VfsFcntl(fildes, F_SETFD, FD_CLOEXEC));
+   }
+ #endif
++  return fd->fildes;
+ }
+ 
+ #ifdef SCM_RIGHTS
+@@ -276,8 +279,7 @@ static i64 ReceiveScmRights(struct Machine *m, struct msghdr_linux *gm,
+     }
+     // serialize fds
+     for (i = 0; i < relayable; ++i) {
+-      Write32(fd[i], p[i]);
+-      TrackScmRightsFd(m, p[i], flags);
++      Write32(fd[i], TrackScmRightsFd(m, p[i], flags));
+     }
+     // close excess fds
+     for (i = relayable; i < received; ++i) {
+diff --git a/blink/close.c b/blink/close.c
+index daf01d6..db48241 100644
+--- a/blink/close.c
++++ b/blink/close.c
+@@ -39,7 +39,7 @@ static int CloseFd(struct Fd *fd) {
+   if (fd->dirstream) {
+     rc = VfsClosedir(fd->dirstream);
+   } else {
+-    rc = fd->cb->close(fd->fildes);
++    rc = fd->cb->close(fd->hostfd);
+   }
+   FreeFd(fd);
+   return rc;
+@@ -100,7 +100,7 @@ static int SysCloseRangeCloexec(struct Machine *m, u32 first, u32 last) {
+     if (first <= (u32)fd->fildes && (u32)fd->fildes <= last) {
+       if (~fd->oflags & O_CLOEXEC) {
+         fd->oflags |= O_CLOEXEC;
+-        VfsFcntl(fd->fildes, F_SETFD, FD_CLOEXEC);
++        VfsFcntl(fd->hostfd, F_SETFD, FD_CLOEXEC);
+       }
+     }
+   }
+diff --git a/blink/fds.c b/blink/fds.c
+index dbb19df..cef31ee 100644
+--- a/blink/fds.c
++++ b/blink/fds.c
+@@ -41,13 +41,37 @@ void InitFds(struct Fds *fds) {
+   unassert(!pthread_mutex_init(&fds->lock, 0));
+ }
+ 
++#ifdef HAVE_VIRTUAL_FDS
++// returns lowest guest fd number that's at least `minfildes` and free
++int GetFreeFildes(struct Fds *fds, int minfildes) {
++  int i, n;
++  bool *used;
++  struct Dll *e;
++  n = CountFds(fds) + 1;  // so the answer is below minfildes + n
++  unassert((used = (bool *)calloc(n, sizeof(*used))));
++  for (e = dll_first(fds->list); e; e = dll_next(fds->list, e)) {
++    i = FD_CONTAINER(e)->fildes - minfildes;
++    if (0 <= i && i < n) used[i] = true;
++  }
++  for (i = 0; used[i]; ++i) {
++  }
++  free(used);
++  return minfildes + i;
++}
++#endif
++
+ struct Fd *AddFd(struct Fds *fds, int fildes, int oflags) {
+   struct Fd *fd;
+   if (fildes >= 0) {
+     if ((fd = (struct Fd *)calloc(1, sizeof(*fd)))) {
+       dll_init(&fd->elem);
+       fd->cb = &kFdCbHost;
++#ifdef HAVE_VIRTUAL_FDS
++      fd->fildes = GetFreeFildes(fds, 0);
++#else
+       fd->fildes = fildes;
++#endif
++      fd->hostfd = fildes;
+       fd->oflags = oflags;
+       unassert(!pthread_mutex_init(&fd->lock, 0));
+       dll_make_first(&fds->list, &fd->elem);
+@@ -144,17 +168,19 @@ void InheritFd(struct Fd *fd) {
+ #ifndef DISABLE_SOCKETS
+   socklen_t addrlen;
+   if (!fd) return;
+-  if (!GetFdSocketType(fd->fildes, &fd->socktype)) {
+-    fd->norestart = IsNoRestartSocket(fd->fildes);
++  if (!GetFdSocketType(fd->hostfd, &fd->socktype)) {
++    fd->norestart = IsNoRestartSocket(fd->hostfd);
+     addrlen = sizeof(fd->saddr);
+-    VfsGetsockname(fd->fildes, (struct sockaddr *)&fd->saddr, &addrlen);
++    VfsGetsockname(fd->hostfd, (struct sockaddr *)&fd->saddr, &addrlen);
+   }
+ #endif
+ }
+ 
+ void AddStdFd(struct Fds *fds, int fildes) {
+   int flags;
++  struct Fd *fd;
+   if ((flags = VfsFcntl(fildes, F_GETFL, 0)) >= 0) {
+-    InheritFd(AddFd(fds, fildes, flags));
++    if ((fd = AddFd(fds, fildes, flags))) fd->fildes = fildes;
++    InheritFd(fd);
+   }
+ }
+diff --git a/blink/fds.h b/blink/fds.h
+index 6fbaabf..83ede47 100644
+--- a/blink/fds.h
++++ b/blink/fds.h
+@@ -29,7 +29,8 @@ struct FdCb {
+ };
+ 
+ struct Fd {
+-  int fildes;      // file descriptor
++  int fildes;      // guest file descriptor
++  int hostfd;      // host file descriptor
+   int oflags;      // host O_XXX constants
+   int socktype;    // host SOCK_XXX constants
+   bool norestart;  // is SO_RCVTIMEO in play?
+@@ -50,10 +51,15 @@ struct Fds {
+   pthread_mutex_t_ lock;
+ };
+ 
++// guest fds are normally the same numbers as the host fds they wrap.
++// HAVE_VIRTUAL_FDS has blink choose the guest numbers instead, which
++// is needed when guest processes share a single host fd table. It's
++// possible to define it on any host, in order to test that mode.
++
+ extern const struct FdCb kFdCbHost;
+ 
+ void InitFds(struct Fds *);
+-struct Fd *AddFd(struct Fds *, int, int);
++struct Fd *AddFd(struct Fds *, int, int);  // takes a host fd
+ struct Fd *ForkFd(struct Fds *, struct Fd *, int, int);
+ struct Fd *GetFd(struct Fds *, int);
+ void LockFd(struct Fd *);
+@@ -62,5 +68,11 @@ int CountFds(struct Fds *);
+ void FreeFd(struct Fd *);
+ void DestroyFds(struct Fds *);
+ void InheritFd(struct Fd *);
++#ifdef HAVE_VIRTUAL_FDS
++// GetFreeFildes() scans the table, which is fine since there can't be
++// more than kMaxVirtualFds, which is also emscripten's MAX_OPEN_FDS
++#define kMaxVirtualFds 4096
++int GetFreeFildes(struct Fds *, int);
++#endif
+ 
+ #endif /* BLINK_FDS_H_ */
+diff --git a/blink/ioctl.c b/blink/ioctl.c
+index 82fa79e..f223a12 100644
+--- a/blink/ioctl.c
++++ b/blink/ioctl.c
+@@ -203,7 +203,8 @@ static int IoctlSiocgifaddr(struct Machine *m, int systemfd, i64 ifreq_addr,
+ static int IoctlFionbio(struct Machine *m, int fildes) {
+   int oflags;
+   if ((oflags = GetOflags(m, fildes)) == -1) return -1;
+-  return VfsFcntl(fildes, F_SETFL, (oflags & SETFL_FLAGS) | O_NDELAY);
++  return VfsFcntl(GetHostFd(fildes), F_SETFL,
++                  (oflags & SETFL_FLAGS) | O_NDELAY);
+ }
+ 
+ static int IoctlFioclex(struct Machine *m, int fildes) {
+@@ -299,6 +300,7 @@ static int IoctlTiocsti(struct Machine *m, int fildes, i64 addr) {
+ #endif
+ 
+ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
++  int hostfd = -1;
+   struct Fd *fd;
+   int (*tcgetattr_impl)(int, struct termios *);
+   int (*tcsetattr_impl)(int, int, const struct termios *);
+@@ -307,6 +309,7 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
+   LOCK(&m->system->fds.lock);
+   if ((fd = GetFd(&m->system->fds, fildes))) {
+     unassert(fd->cb);
++    hostfd = fd->hostfd;
+     unassert(tcgetattr_impl = fd->cb->tcgetattr);
+     unassert(tcsetattr_impl = fd->cb->tcsetattr);
+     unassert(tcgetwinsize_impl = fd->cb->tcgetwinsize);
+@@ -319,6 +322,10 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
+   }
+   UNLOCK(&m->system->fds.lock);
+   if (!fd) return -1;
++#ifndef DISABLE_NONPOSIX
++  if (request == FIONBIO_LINUX) return IoctlFionbio(m, fildes);
++#endif
++  fildes = hostfd;  // the remaining requests only talk to the host
+   switch (request) {
+     case TIOCGWINSZ_LINUX:
+       return IoctlTiocgwinsz(m, fildes, addr, tcgetwinsize_impl);
+@@ -337,8 +344,6 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
+     case TIOCSPGRP_LINUX:
+       return IoctlTiocspgrp(m, fildes, addr);
+ #ifndef DISABLE_NONPOSIX
+-    case FIONBIO_LINUX:
+-      return IoctlFionbio(m, fildes);
+     case FIOCLEX_LINUX:
+       return IoctlFioclex(m, fildes);
+     case FIONCLEX_LINUX:
+diff --git a/blink/memorymalloc.c b/blink/memorymalloc.c
+index f40106b..6f1a5af 100644
+--- a/blink/memorymalloc.c
++++ b/blink/memorymalloc.c
+@@ -203,6 +203,9 @@ int GetFileDescriptorLimit(struct System *s) {
+   LOCK(&s->mmap_lock);
+   lim = Read64(s->rlim[RLIMIT_NOFILE_LINUX].cur);
+   UNLOCK(&s->mmap_lock);
++#ifdef HAVE_VIRTUAL_FDS
++  if (lim > kMaxVirtualFds) lim = kMaxVirtualFds;
++#endif
+   if (lim > INT_MAX) lim = INT_MAX;
+   return lim;
+ }
+diff --git a/blink/open.c b/blink/open.c
+index f717c07..5ef8218 100644
+--- a/blink/open.c
++++ b/blink/open.c
+@@ -49,6 +49,7 @@ static int SysTmpfile(struct Machine *m, i32 dirfildes, i64 pathaddr,
+   char name[13];
+   int supported;
+   int unsupported;
++  struct Fd *fd;
+   sigset_t ss, oldss;
+   sysflags = O_CREAT | O_EXCL | O_CLOEXEC;
+   switch (oflags & O_ACCMODE_LINUX) {
+@@ -91,7 +92,8 @@ static int SysTmpfile(struct Machine *m, i32 dirfildes, i64 pathaddr,
+           unassert(!VfsFcntl(fildes, F_SETFD, FD_CLOEXEC));
+         }
+         LOCK(&m->system->fds.lock);
+-        unassert(AddFd(&m->system->fds, fildes, oflags));
++        unassert(fd = AddFd(&m->system->fds, fildes, oflags));
++        fildes = fd->fildes;
+         UNLOCK(&m->system->fds.lock);
+       } else {
+         unassert(!VfsClose(tmpdir));
+@@ -130,6 +132,7 @@ int SysOpenat(struct Machine *m, i32 dirfildes, i64 pathaddr, i32 oflags,
+       LOCK(&m->system->fds.lock);
+       unassert(fd = AddFd(&m->system->fds, fildes, sysflags));
+       fd->path = JoinPath(GetDirFildesPath(m->system, dirfildes), path);
++      fildes = fd->fildes;
+       UNLOCK(&m->system->fds.lock);
+     }
+   } else {
+diff --git a/blink/pipe.c b/blink/pipe.c
+index 011e442..9b594ed 100644
+--- a/blink/pipe.c
++++ b/blink/pipe.c
+@@ -41,6 +41,7 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
+   int fds[2];
+   int oflags;
+   int supported;
++  struct Fd *fd;
+   u8 fds_linux[2][4];
+   supported = O_CLOEXEC_LINUX | O_NDELAY_LINUX;
+   if (flags & ~supported) {
+@@ -74,11 +75,11 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
+       rc = emfile();
+     } else {
+       LOCK(&m->system->fds.lock);
+-      unassert(AddFd(&m->system->fds, fds[0], O_RDONLY | oflags));
+-      unassert(AddFd(&m->system->fds, fds[1], O_WRONLY | oflags));
++      unassert(fd = AddFd(&m->system->fds, fds[0], O_RDONLY | oflags));
++      Write32(fds_linux[0], fd->fildes);
++      unassert(fd = AddFd(&m->system->fds, fds[1], O_WRONLY | oflags));
++      Write32(fds_linux[1], fd->fildes);
+       UNLOCK(&m->system->fds.lock);
+-      Write32(fds_linux[0], fds[0]);
+-      Write32(fds_linux[1], fds[1]);
+       unassert(!CopyToUserWrite(m, pipefds_addr, fds_linux, sizeof(fds_linux)));
+       rc = 0;
+     }
+diff --git a/blink/syscall.c b/blink/syscall.c
+index 34cc01c..301f40b 100644
+--- a/blink/syscall.c
++++ b/blink/syscall.c
+@@ -208,9 +208,20 @@ struct Fd *GetAndLockFd(struct Machine *m, int fildes) {
+   return fd;
+ }
+ 
++#ifdef HAVE_VIRTUAL_FDS
++int GetHostFd(int fildes) {
++  struct Fd *fd;
++  int hostfd = -1;
++  LOCK(&g_machine->system->fds.lock);
++  if ((fd = GetFd(&g_machine->system->fds, fildes))) hostfd = fd->hostfd;
++  UNLOCK(&g_machine->system->fds.lock);
++  return hostfd;
++}
++#endif
++
+ int GetDirFildes(int fildes) {
+   if (fildes == AT_FDCWD_LINUX) return AT_FDCWD;
+-  return fildes;
++  return GetHostFd(fildes);
+ }
+ 
+ const char *GetDirFildesPath(struct System *s, int fildes) {
+@@ -1234,7 +1245,7 @@ static i64 SysMmapImpl(struct Machine *m, i64 virt, i64 size, int prot,
+     }
+   }
+ CreateTheMap:
+-  virt = ReserveVirtual(m->system, virt, size, key, fildes, offset,
++  virt = ReserveVirtual(m->system, virt, size, key, GetHostFd(fildes), offset,
+                         !!(flags & MAP_SHARED_LINUX), fixedmap);
+   if (virt != -1 && newautomap != -1) {
+     m->system->automap = newautomap;
+@@ -1303,6 +1314,50 @@ static int SysMsync(struct Machine *m, i64 virt, u64 size, int flags) {
+   return SyncVirtual(m->system, virt, size, flags);
+ }
+ 
++#ifdef HAVE_VIRTUAL_FDS
++// implements dup(), dup2(), dup3() and F_DUPFD when blink chooses the
++// guest fd numbers. the new guest fd is `newfildes` if it's not -1, in
++// which case whatever was there is closed, otherwise it's the lowest
++// free number at least `minfildes`. it wraps a host dup() of the fd.
++static int DupGuestFd(struct Machine *m, int fildes, int newfildes,
++                      int minfildes, int cloexec) {
++  int rc, lim, hostfd;
++  struct Fd *fd, *fd2, *old = 0;
++  lim = GetFileDescriptorLimit(m->system);  // mmap_lock comes before fds.lock
++  LOCK(&m->system->fds.lock);
++  if (!(fd = GetFd(&m->system->fds, fildes))) {
++    rc = -1;
++  } else if (newfildes == fildes) {
++    rc = fildes;
++  } else if ((hostfd = VfsDup(fd->hostfd)) == -1) {
++    rc = -1;
++  } else {
++    if (newfildes == -1) {
++      newfildes = GetFreeFildes(&m->system->fds, minfildes);
++    } else if ((old = GetFd(&m->system->fds, newfildes))) {
++      dll_remove(&m->system->fds.list, &old->elem);
++    }
++    if (newfildes >= lim) {
++      VfsClose(hostfd);
++      rc = emfile();
++    } else if (!(fd2 = ForkFd(&m->system->fds, fd, hostfd,
++                              (fd->oflags & ~O_CLOEXEC) | cloexec))) {
++      VfsClose(hostfd);
++      rc = -1;
++    } else {
++      fd2->cb = fd->cb;
++      fd2->fildes = rc = newfildes;
++    }
++  }
++  UNLOCK(&m->system->fds.lock);
++  if (old) {
++    old->cb->close(old->hostfd);
++    FreeFd(old);
++  }
++  return rc;
++}
++#endif
++
+ static int SysDup1(struct Machine *m, i32 fildes) {
+   int lim;
+   int oflags;
+@@ -1310,6 +1365,9 @@ static int SysDup1(struct Machine *m, i32 fildes) {
+   struct Fd *fd;
+   if (fildes < 0) return ebadf();
+   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
++#ifdef HAVE_VIRTUAL_FDS
++  return DupGuestFd(m, fildes, -1, 0, 0);
++#endif
+   if ((newfildes = VfsDup(fildes)) != -1) {
+     if (newfildes >= lim) {
+       VfsClose(newfildes);
+@@ -1349,6 +1407,10 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
+     LOGF("dup2() ebadf");
+     return ebadf();
+   }
++#ifdef HAVE_VIRTUAL_FDS
++  if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
++  return DupGuestFd(m, fildes, newfildes, 0, 0);
++#endif
+   if (fildes == newfildes) {
+     // no-op system call, but still must validate
+     LOCK(&m->system->fds.lock);
+@@ -1382,6 +1444,10 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
+   if (fildes == newfildes) return einval();
+   if (flags & ~O_CLOEXEC_LINUX) return einval();
+   if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
++#ifdef HAVE_VIRTUAL_FDS
++  return DupGuestFd(m, fildes, newfildes, 0,
++                    flags & O_CLOEXEC_LINUX ? O_CLOEXEC : 0);
++#endif
+ #ifdef HAVE_DUP3
+   if ((rc = Dup3(m, fildes, newfildes, XlatOpenFlags(flags))) != -1) {
+ #else
+@@ -1410,6 +1476,11 @@ static int SysDupf(struct Machine *m, i32 fildes, i32 minfildes, int cmd) {
+   struct Fd *fd;
+   int lim, oflags, newfildes;
+   if (minfildes >= (lim = GetFileDescriptorLimit(m->system))) return emfile();
++#ifdef HAVE_VIRTUAL_FDS
++  if (minfildes < 0) return einval();
++  return DupGuestFd(m, fildes, -1, minfildes,
++                    cmd == F_DUPFD_CLOEXEC ? O_CLOEXEC : 0);
++#endif
+   if ((newfildes = VfsFcntl(fildes, cmd, minfildes)) != -1) {
+     if (newfildes >= lim) {
+       VfsClose(newfildes);
+@@ -1504,6 +1575,7 @@ static int SysSocket(struct Machine *m, i32 family, i32 type, i32 protocol) {
+                  O_RDWR | (flags & SOCK_CLOEXEC_LINUX ? O_CLOEXEC : 0) |
+                      (flags & SOCK_NONBLOCK_LINUX ? O_NDELAY : 0));
+       fd->socktype = type;
++      fildes = fd->fildes;
+       UNLOCK(&m->system->fds.lock);
+     }
+   }
+@@ -1538,11 +1610,11 @@ static int SysSocketpair(struct Machine *m, i32 family, i32 type, i32 protocol,
+       if (flags & SOCK_NONBLOCK_LINUX) sysflags |= O_NDELAY;
+       unassert(fd = AddFd(&m->system->fds, fds[0], sysflags));
+       fd->socktype = type;
++      Write32(fds_linux[0], fd->fildes);
+       unassert(fd = AddFd(&m->system->fds, fds[1], sysflags));
+       fd->socktype = type;
++      Write32(fds_linux[1], fd->fildes);
+       UNLOCK(&m->system->fds.lock);
+-      Write32(fds_linux[0], fds[0]);
+-      Write32(fds_linux[1], fds[1]);
+       unassert(!CopyToUserWrite(m, pipefds_addr, fds_linux, sizeof(fds_linux)));
+     }
+   }
+@@ -1607,7 +1679,7 @@ static int SysSocketName(struct Machine *m, i32 fildes, i64 sockaddr_addr,
+   socklen_t addrlen;
+   struct sockaddr_storage addr;
+   addrlen = sizeof(addr);
+-  rc = SocketName(fildes, (struct sockaddr *)&addr, &addrlen);
++  rc = SocketName(GetHostFd(fildes), (struct sockaddr *)&addr, &addrlen);
+   if (rc != -1) {
+     if (StoreSockaddr(m, sockaddr_addr, sockaddr_size_addr,
+                       (struct sockaddr *)&addr, addrlen) == -1) {
+@@ -1665,8 +1737,9 @@ static int SysAccept4(struct Machine *m, i32 fildes, i64 sockaddr_addr,
+   }
+   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+   addrlen = sizeof(addr);
+-  INTERRUPTIBLE(restartable,
+-                newfd = VfsAccept(fildes, (struct sockaddr *)&addr, &addrlen));
++  INTERRUPTIBLE(
++      restartable,
++      newfd = VfsAccept(GetHostFd(fildes), (struct sockaddr *)&addr, &addrlen));
+   if (newfd != -1) {
+     if (newfd >= lim) {
+       VfsClose(newfd);
+@@ -1675,11 +1748,13 @@ static int SysAccept4(struct Machine *m, i32 fildes, i64 sockaddr_addr,
+       FixupSock(newfd, flags);
+       LOCK(&m->system->fds.lock);
+       if (!(fd = GetFd(&m->system->fds, fildes)) ||
+-          !ForkFd(&m->system->fds, fd, newfd,
+-                  O_RDWR | (flags & SOCK_CLOEXEC_LINUX ? O_CLOEXEC : 0) |
+-                      (flags & SOCK_NONBLOCK_LINUX ? O_NDELAY : 0))) {
++          !(fd = ForkFd(&m->system->fds, fd, newfd,
++                        O_RDWR | (flags & SOCK_CLOEXEC_LINUX ? O_CLOEXEC : 0) |
++                            (flags & SOCK_NONBLOCK_LINUX ? O_NDELAY : 0)))) {
+         VfsClose(newfd);
+         newfd = -1;
++      } else {
++        newfd = fd->fildes;
+       }
+       UNLOCK(&m->system->fds.lock);
+       if (newfd != -1) {
+@@ -1905,7 +1980,8 @@ static i64 SysSendto(struct Machine *m,  //
+   if ((rc = AppendIovsReal(m, &iv, bufaddr, buflen, PROT_READ)) != -1) {
+     msg.msg_iov = iv.p;
+     msg.msg_iovlen = iv.i;
+-    INTERRUPTIBLE(!norestart, rc = VfsSendmsg(fildes, &msg, hostflags));
++    INTERRUPTIBLE(!norestart,
++                  rc = VfsSendmsg(GetHostFd(fildes), &msg, hostflags));
+   }
+   FreeIovs(&iv);
+   return HandleSigpipe(m, rc, flags);
+@@ -1936,7 +2012,8 @@ static i64 SysRecvfrom(struct Machine *m,  //
+   if ((rc = AppendIovsReal(m, &iv, bufaddr, buflen, PROT_WRITE)) != -1) {
+     msg.msg_iov = iv.p;
+     msg.msg_iovlen = iv.i;
+-    INTERRUPTIBLE(!norestart, rc = VfsRecvmsg(fildes, &msg, hostflags));
++    INTERRUPTIBLE(!norestart,
++                  rc = VfsRecvmsg(GetHostFd(fildes), &msg, hostflags));
+     if (rc != -1) {
+       StoreSockaddr(m, sockaddr_addr, sockaddr_size_addr,
+                     (struct sockaddr *)msg.msg_name, msg.msg_namelen);
+@@ -2001,7 +2078,7 @@ static i64 SysSendmsg(struct Machine *m, i32 fildes, i64 msgaddr, i32 flags) {
+   if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
+     msg.msg_iov = iv.p;
+     msg.msg_iovlen = iv.i;
+-    INTERRUPTIBLE(!norestart, rc = VfsSendmsg(fildes, &msg, flags));
++    INTERRUPTIBLE(!norestart, rc = VfsSendmsg(GetHostFd(fildes), &msg, flags));
+   }
+   FreeIovs(&iv);
+   return HandleSigpipe(m, rc, flags);
+@@ -2044,7 +2121,7 @@ static i64 SysRecvmsg(struct Machine *m, i32 fildes, i64 msgaddr, i32 flags) {
+       msg.msg_name = &addr;
+       msg.msg_namelen = sizeof(addr);
+     }
+-    INTERRUPTIBLE(!norestart, rc = VfsRecvmsg(fildes, &msg, flags));
++    INTERRUPTIBLE(!norestart, rc = VfsRecvmsg(GetHostFd(fildes), &msg, flags));
+     if (rc != -1) {
+       Write32(gm.flags, UnXlatMsgFlags(msg.msg_flags));
+       unassert(CopyToUserWrite(m, msgaddr, &gm, sizeof(gm)) != -1);
+@@ -2176,8 +2253,9 @@ static int SysConnectBind(struct Machine *m, i32 fildes, i64 sockaddr_addr,
+   } else {
+     return -1;
+   }
+-  INTERRUPTIBLE(!norestart,
+-                (rc = impl(fildes, (const struct sockaddr *)&addr, addrlen)));
++  INTERRUPTIBLE(
++      !norestart,
++      (rc = impl(GetHostFd(fildes), (const struct sockaddr *)&addr, addrlen)));
+   if (rc != -1 && impl == VfsBind) {
+     LOCK(&m->system->fds.lock);
+     if ((fd = GetFd(&m->system->fds, fildes))) {
+@@ -2214,7 +2292,8 @@ static int GetsockoptInt32(struct Machine *m, i32 fd, int level, int optname,
+   optvalsize_linux = Read32(psize);
+   if (!IsValidMemory(m, optvaladdr, optvalsize_linux, PROT_WRITE)) return -1;
+   optvalsize = sizeof(val);
+-  if ((rc = VfsGetsockopt(fd, level, optname, &val, &optvalsize)) != -1) {
++  if ((rc = VfsGetsockopt(GetHostFd(fd), level, optname, &val, &optvalsize)) !=
++      -1) {
+     if ((val = xlat(val)) == -1) return -1;
+     Write32(gval, val);
+     CopyToUserWrite(m, optvaladdr, &gval, MIN(sizeof(gval), optvalsize_linux));
+@@ -2234,7 +2313,8 @@ static int SetsockoptLinger(struct Machine *m, i32 fildes, i64 optvaladdr,
+   }
+   hl.l_onoff = (i32)Read32(gl->onoff);
+   hl.l_linger = (i32)Read32(gl->linger);
+-  return VfsSetsockopt(fildes, SOL_SOCKET, SO_LINGER_, &hl, sizeof(hl));
++  return VfsSetsockopt(GetHostFd(fildes), SOL_SOCKET, SO_LINGER_, &hl,
++                       sizeof(hl));
+ }
+ 
+ static int GetsockoptLinger(struct Machine *m, i32 fd, i64 optvaladdr,
+@@ -2249,8 +2329,8 @@ static int GetsockoptLinger(struct Machine *m, i32 fd, i64 optvaladdr,
+   optvalsize_linux = Read32(psize);
+   if (!IsValidMemory(m, optvaladdr, optvalsize_linux, PROT_WRITE)) return -1;
+   optvalsize = sizeof(hl);
+-  if ((rc = VfsGetsockopt(fd, SOL_SOCKET, SO_LINGER_, &hl, &optvalsize)) !=
+-      -1) {
++  if ((rc = VfsGetsockopt(GetHostFd(fd), SOL_SOCKET, SO_LINGER_, &hl,
++                          &optvalsize)) != -1) {
+     Write32(gl.onoff, hl.l_onoff);
+     Write32(gl.linger, hl.l_linger);
+     CopyToUserWrite(m, optvaladdr, &gl, MIN(sizeof(gl), optvalsize_linux));
+@@ -2281,7 +2361,8 @@ static int SysSetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
+   if (XlatSocketLevel(level, &syslevel) == -1) return -1;
+   if ((sysoptname = XlatSocketOptname(level, optname)) == -1) return -1;
+   if (!(optval = SchlepR(m, optvaladdr, optvalsize))) return -1;
+-  rc = VfsSetsockopt(fildes, syslevel, sysoptname, optval, optvalsize);
++  rc = VfsSetsockopt(GetHostFd(fildes), syslevel, sysoptname, optval,
++                     optvalsize);
+   if (rc != -1 &&                      //
+       level == SOL_SOCKET_LINUX &&     //
+       optname == SO_RCVTIMEO_LINUX &&  //
+@@ -2329,7 +2410,8 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
+   optvalsize = Read32(optvalsize_linux);
+   if (optvalsize > 256) return einval();
+   if (!(optval = AddToFreeList(m, calloc(1, optvalsize)))) return -1;
+-  rc = VfsGetsockopt(fildes, syslevel, sysoptname, optval, &optvalsize);
++  rc = VfsGetsockopt(GetHostFd(fildes), syslevel, sysoptname, optval,
++                     &optvalsize);
+   Write32(optvalsize_linux, optvalsize);
+   CopyToUserWrite(m, optvaladdr, optval, optvalsize);
+   CopyToUserWrite(m, optvalsizeaddr, optvalsize_linux,
+@@ -2359,7 +2441,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+   if (size) {
+     InitIovs(&iv);
+     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
+-      RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
++      RESTARTABLE(rc = readv_impl(GetHostFd(fildes), iv.p, iv.i));
+       if (rc != -1) SetWriteAddr(m, addr, rc);
+     }
+     FreeIovs(&iv);
+@@ -2391,7 +2473,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+   if (size) {
+     InitIovs(&iv);
+     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
+-      RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
++      RESTARTABLE(rc = writev_impl(GetHostFd(fildes), iv.p, iv.i));
+       if (rc != -1) SetReadAddr(m, addr, rc);
+     }
+     FreeIovs(&iv);
+@@ -2432,7 +2514,7 @@ static i64 SysPread(struct Machine *m, i32 fildes, i64 addr, u64 size,
+   if (size) {
+     InitIovs(&iv);
+     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
+-      RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
++      RESTARTABLE(rc = VfsPreadv(GetHostFd(fildes), iv.p, iv.i, offset));
+       if (rc != -1) SetWriteAddr(m, addr, rc);
+     }
+     FreeIovs(&iv);
+@@ -2451,7 +2533,7 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
+   if (size) {
+     InitIovs(&iv);
+     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
+-      RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, offset));
++      RESTARTABLE(rc = VfsPwritev(GetHostFd(fildes), iv.p, iv.i, offset));
+       if (rc != -1) SetReadAddr(m, addr, rc);
+     }
+     FreeIovs(&iv);
+@@ -2490,13 +2572,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+     if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
+       if (iv.i) {
+         if (offset == -1) {
+-          RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
++          RESTARTABLE(rc = readv_impl(GetHostFd(fildes), iv.p, iv.i));
+         } else if (offset < 0) {
+           return einval();
+         } else if (offset > NUMERIC_MAX(off_t)) {
+           return eoverflow();
+         } else {
+-          RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
++          RESTARTABLE(rc = VfsPreadv(GetHostFd(fildes), iv.p, iv.i, offset));
+         }
+       } else {
+         rc = 0;
+@@ -2538,14 +2620,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+     if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
+       if (iv.i) {
+         if (offset == -1) {
+-          RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
++          RESTARTABLE(rc = writev_impl(GetHostFd(fildes), iv.p, iv.i));
+           rc = HandleSigpipe(m, rc, 0);
+         } else if (offset < 0) {
+           return einval();
+         } else if (offset > NUMERIC_MAX(off_t)) {
+           return eoverflow();
+         } else {
+-          RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, offset));
++          RESTARTABLE(rc = VfsPwritev(GetHostFd(fildes), iv.p, iv.i, offset));
+         }
+       } else {
+         rc = 0;
+@@ -2586,6 +2668,8 @@ static i64 SysSendfile(struct Machine *m, i32 out_fd, i32 in_fd, i64 offsetaddr,
+   size_t chunk, maxchunk = 16384;
+   if (CheckFdAccess(m, out_fd, true, EBADF) == -1) return -1;
+   if (CheckFdAccess(m, in_fd, false, EBADF) == -1) return -1;
++  out_fd = GetHostFd(out_fd);
++  in_fd = GetHostFd(in_fd);
+   if (offsetaddr && !(offsetp = (u8 *)SchlepRW(m, offsetaddr, 8))) return -1;
+   if (!(buf = (u8 *)AddToFreeList(m, malloc(maxchunk)))) return -1;
+   if (offsetp) {
+@@ -2654,8 +2738,8 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+   if (size < sizeof(rec) - sizeof(rec.name)) return einval();
+   if ((fd->oflags & O_DIRECTORY) != O_DIRECTORY) return enotdir();
+   if (!IsValidMemory(m, addr, size, PROT_WRITE)) return -1;
+-  if (VfsFstat(fildes, &st) || !st.st_nlink) return enoent();
+-  if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
++  if (VfsFstat(fd->hostfd, &st) || !st.st_nlink) return enoent();
++  if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->hostfd))) {
+     return -1;
+   }
+   for (i = 0; i + sizeof(rec) <= size; i += reclen) {
+@@ -2680,7 +2764,7 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
+     type = UnXlatDt(ent->d_type);
+ #else
+     struct stat st;
+-    if (fstatat(fd->fildes, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
++    if (fstatat(fd->hostfd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
+       LOGF("getdents() fstatat(%d, %s) failed: %s", fd->fildes, ent->d_name,
+            DescribeHostErrno(errno));
+       type = DT_UNKNOWN_LINUX;
+@@ -2743,7 +2827,7 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
+   if (offset < -NUMERIC_MAX(off_t) - 1) return eoverflow();
+   if (!(fd = GetAndLockFd(m, fildes))) return -1;
+   if (!fd->dirstream) {
+-    rc = VfsSeek(fd->fildes, offset, XlatWhence(whence));
++    rc = VfsSeek(fd->hostfd, offset, XlatWhence(whence));
+   } else if (whence == SEEK_SET_LINUX) {
+     if (!offset) {
+       VfsRewinddir(fd->dirstream);
+@@ -2769,7 +2853,7 @@ static i64 SysFtruncate(struct Machine *m, i32 fildes, i64 length) {
+   if (length < 0) return einval();
+   if (length > NUMERIC_MAX(off_t)) return eoverflow();
+   if (CheckFdAccess(m, fildes, true, EINVAL) == -1) return -1;
+-  RESTARTABLE(rc = VfsFtruncate(fildes, length));
++  RESTARTABLE(rc = VfsFtruncate(GetHostFd(fildes), length));
+   return rc;
+ }
+ 
+@@ -2809,7 +2893,7 @@ static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
+   int rc;
+   struct stat st;
+   struct stat_linux gst;
+-  if ((rc = VfsFstat(fd, &st)) != -1) {
++  if ((rc = VfsFstat(GetHostFd(fd), &st)) != -1) {
+     XlatStatToLinux(&gst, &st);
+     if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
+   }
+@@ -2892,7 +2976,7 @@ static int XlatFchownatFlags(int x) {
+ }
+ 
+ static int SysFchown(struct Machine *m, i32 fildes, u32 uid, u32 gid) {
+-  return VfsFchown(fildes, uid, gid);
++  return VfsFchown(GetHostFd(fildes), uid, gid);
+ }
+ 
+ static int SysFchownat(struct Machine *m, i32 dirfd, i64 pathaddr, u32 uid,
+@@ -2959,7 +3043,7 @@ static int SysSync(struct Machine *m) {
+   for (e = dll_first(m->system->fds.list); e;
+        e = dll_next(m->system->fds.list, e)) {
+     if ((p2 = (int *)realloc(p, (n + 1) * sizeof(*p)))) {
+-      (p = p2)[n++] = FD_CONTAINER(e)->fildes;
++      (p = p2)[n++] = FD_CONTAINER(e)->hostfd;
+     } else {
+       break;
+     }
+@@ -2979,10 +3063,10 @@ static int CheckSyncable(int fildes) {
+   // synchronize character devices, e.g. /dev/null. An unresolved
+   // question though is if FreeBSD actually does something here.
+   struct stat st;
+-  if (!VfsFstat(fildes, &st) &&  //
+-      (S_ISCHR(st.st_mode) ||    //
+-       S_ISFIFO(st.st_mode) ||   //
+-       S_ISLNK(st.st_mode) ||    //
++  if (!VfsFstat(GetHostFd(fildes), &st) &&  //
++      (S_ISCHR(st.st_mode) ||               //
++       S_ISFIFO(st.st_mode) ||              //
++       S_ISLNK(st.st_mode) ||               //
+        S_ISSOCK(st.st_mode))) {
+     return einval();
+   }
+@@ -2996,7 +3080,7 @@ static int SysFsync(struct Machine *m, i32 fildes) {
+   int rc;
+   // MacOS fsync() provides weaker guarantees than Linux fsync()
+   // https://mjtsai.com/blog/2022/02/17/apple-ssd-benchmarks-and-f_fullsync/
+-  if ((rc = VfsFcntl(fildes, F_FULLFSYNC, 0))) {
++  if ((rc = VfsFcntl(GetHostFd(fildes), F_FULLFSYNC, 0))) {
+     // If the FULLFSYNC failed, fall back to attempting an fsync(). It
+     // shouldn't be possible for fullfsync to fail on the local file
+     // system (on OSX), so failure indicates that FULLFSYNC isn't
+@@ -3006,11 +3090,11 @@ static int SysFsync(struct Machine *m, i32 fildes) {
+     // every time sync is called. ──Quoth SQLite (os_unix.c) It's also
+     // possible for F_FULLFSYNC to fail on Cosmopolitan Libc when our
+     // binary isn't running on MacOS.
+-    rc = VfsFsync(fildes);
++    rc = VfsFsync(GetHostFd(fildes));
+   }
+   return rc;
+ #else
+-  return VfsFsync(fildes);
++  return VfsFsync(GetHostFd(fildes));
+ #endif
+ }
+ 
+@@ -3018,20 +3102,20 @@ static int SysFdatasync(struct Machine *m, i32 fildes) {
+   if (CheckSyncable(fildes) == -1) return -1;
+ #ifdef F_FULLSYNC
+   int rc;
+-  if ((rc = VfsFcntl(fildes, F_FULLFSYNC, 0))) {
+-    rc = VfsFsync(fildes);
++  if ((rc = VfsFcntl(GetHostFd(fildes), F_FULLFSYNC, 0))) {
++    rc = VfsFsync(GetHostFd(fildes));
+   }
+   return rc;
+ #elif defined(__APPLE__)
+   // fdatasync() on HFS+ doesn't yet flush the file size if it changed
+   // correctly so currently we default to the macro that redefines
+   // fdatasync() to fsync(). ──Quoth SQLite (os_unix.c)
+-  return VfsFsync(fildes);
++  return VfsFsync(GetHostFd(fildes));
+ #elif defined(__HAIKU__)
+   // Haiku doesn't have fdatasync() yet
+-  return VfsFsync(fildes);
++  return VfsFsync(GetHostFd(fildes));
+ #else
+-  return VfsFdatasync(fildes);
++  return VfsFdatasync(GetHostFd(fildes));
+ #endif
+ }
+ 
+@@ -3040,7 +3124,7 @@ static int SysChdir(struct Machine *m, i64 path) {
+ }
+ 
+ static int SysFchdir(struct Machine *m, i32 fildes) {
+-  return VfsFchdir(fildes);
++  return VfsFchdir(GetHostFd(fildes));
+ }
+ 
+ static int XlatLock(int x) {
+@@ -3063,15 +3147,15 @@ static int XlatLock(int x) {
+ 
+ static int SysFlock(struct Machine *m, i32 fd, i32 lock) {
+   if ((lock = XlatLock(lock)) == -1) return -1;
+-  return VfsFlock(fd, lock);
++  return VfsFlock(GetHostFd(fd), lock);
+ }
+ 
+ static int SysShutdown(struct Machine *m, i32 fd, i32 how) {
+-  return VfsShutdown(fd, XlatShutdown(how));
++  return VfsShutdown(GetHostFd(fd), XlatShutdown(how));
+ }
+ 
+ static int SysListen(struct Machine *m, i32 fd, i32 backlog) {
+-  return VfsListen(fd, backlog);
++  return VfsListen(GetHostFd(fd), backlog);
+ }
+ 
+ static int SysMkdirat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
+@@ -3083,7 +3167,7 @@ static int SysMkdir(struct Machine *m, i64 path, i32 mode) {
+ }
+ 
+ static int SysFchmod(struct Machine *m, i32 fd, u32 mode) {
+-  return VfsFchmod(fd, mode);
++  return VfsFchmod(GetHostFd(fd), mode);
+ }
+ 
+ static int SysFchmodat(struct Machine *m, i32 dirfd, i64 path, u32 mode) {
+@@ -3253,7 +3337,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+     rc = UnXlatOpenFlags(fd->oflags);
+   } else if (cmd == F_SETFD_LINUX) {
+     if (!(arg & ~FD_CLOEXEC_LINUX)) {
+-      if (VfsFcntl(fd->fildes, F_SETFD, arg ? FD_CLOEXEC : 0) != -1) {
++      if (VfsFcntl(fd->hostfd, F_SETFD, arg ? FD_CLOEXEC : 0) != -1) {
+         fd->oflags &= ~O_CLOEXEC;
+         if (arg) fd->oflags |= O_CLOEXEC;
+         rc = 0;
+@@ -3266,7 +3350,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+   } else if (cmd == F_SETFL_LINUX) {
+     fl = XlatOpenFlags(arg & (O_APPEND_LINUX | O_ASYNC_LINUX | O_DIRECT_LINUX |
+                               O_NOATIME_LINUX | O_NDELAY_LINUX));
+-    if (VfsFcntl(fd->fildes, F_SETFL, fl) != -1) {
++    if (VfsFcntl(fd->hostfd, F_SETFL, fl) != -1) {
+       fd->oflags &= ~SETFL_FLAGS;
+       fd->oflags |= fl;
+       rc = 0;
+@@ -3277,23 +3361,23 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
+              cmd == F_SETLKW_LINUX ||  //
+              cmd == F_GETLK_LINUX) {
+     UnlockFd(fd);
+-    return SysFcntlLock(m, fildes, cmd, arg);
++    return SysFcntlLock(m, GetHostFd(fildes), cmd, arg);
+ #ifdef F_SETOWN
+   } else if (cmd == F_SETOWN_LINUX) {
+-    rc = VfsFcntl(fd->fildes, F_SETOWN, arg);
++    rc = VfsFcntl(fd->hostfd, F_SETOWN, arg);
+ #endif
+ #ifdef F_GETOWN
+   } else if (cmd == F_GETOWN_LINUX) {
+-    rc = VfsFcntl(fd->fildes, F_GETOWN);
++    rc = VfsFcntl(fd->hostfd, F_GETOWN);
+ #endif
+ #ifndef DISABLE_NONPOSIX
+ #ifdef HAVE_F_GETOWN_EX
+   } else if (cmd == F_SETOWN_EX_LINUX) {
+-    rc = SysFcntlSetownEx(m, fd->fildes, arg);
++    rc = SysFcntlSetownEx(m, fd->hostfd, arg);
+ #endif
+ #ifdef HAVE_F_GETOWN_EX
+   } else if (cmd == F_GETOWN_EX_LINUX) {
+-    rc = SysFcntlGetownEx(m, fd->fildes, arg);
++    rc = SysFcntlGetownEx(m, fd->hostfd, arg);
+ #endif
+ #endif
+   } else {
+@@ -4374,7 +4458,7 @@ static int SysUtimensat(struct Machine *m, i32 fd, i64 pathaddr, i64 tvsaddr,
+       LOGF("%s() flags %d not supported", "utimensat(path=null)", flags);
+       return einval();
+     }
+-    return VfsFutime(fd, tsp);
++    return VfsFutime(GetHostFd(fd), tsp);
+   }
+ }
+ 
+@@ -4490,7 +4574,7 @@ static i32 Select(struct Machine *m,          //
+       }
+       UNLOCK(&m->system->fds.lock);
+       if (fd) {
+-        hfds[0].fd = fildes;
++        hfds[0].fd = GetHostFd(fildes);
+         hfds[0].events = ((FD_ISSET(fildes, &readfds) ? POLLIN : 0) |
+                           (FD_ISSET(fildes, &writefds) ? POLLOUT : 0) |
+                           (FD_ISSET(fildes, &exceptfds) ? POLLPRI : 0));
+@@ -4693,7 +4777,7 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
+           }
+           UNLOCK(&m->system->fds.lock);
+           if (fd) {
+-            hfds[0].fd = fildes;
++            hfds[0].fd = GetHostFd(fildes);
+             ev = Read16(gfds[i].events);
+             hfds[0].events = (((ev & POLLIN_LINUX) ? POLLIN : 0) |
+                               ((ev & POLLOUT_LINUX) ? POLLOUT : 0) |
+@@ -5278,6 +5362,7 @@ static int SysPipe(struct Machine *m, i64 pipefds_addr) {
+ #ifdef HAVE_EPOLL_PWAIT1
+ 
+ static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
++  struct Fd *fd;
+   int lim, fildes, oflags, sysflags;
+   oflags = 0;
+   sysflags = 0;
+@@ -5297,7 +5382,8 @@ static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
+       fildes = emfile();
+     } else {
+       LOCK(&m->system->fds.lock);
+-      unassert(AddFd(&m->system->fds, fildes, oflags));
++      unassert(fd = AddFd(&m->system->fds, fildes, oflags));
++      fildes = fd->fildes;
+       UNLOCK(&m->system->fds.lock);
+     }
+   }
+@@ -5330,7 +5416,7 @@ static i32 SysEpollCtl(struct Machine *m, i32 epfd, i32 op, i32 fd,
+     default:
+       return einval();
+   }
+-  return epoll_ctl(epfd, op, fd, pepe);
++  return epoll_ctl(GetHostFd(epfd), op, GetHostFd(fd), pepe);
+ }
+ 
+ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
+@@ -5376,9 +5462,9 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
+         waitfor = GetZeroTime();
+       }
+ #if defined(HAVE_EPOLL_PWAIT2) && !defined(MUSL_CROSS_MAKE)
+-      rc = epoll_pwait2(epfd, events, maxevents, &waitfor, &oldmask);
++      rc = epoll_pwait2(GetHostFd(epfd), events, maxevents, &waitfor, &oldmask);
+ #else
+-      rc = epoll_pwait(epfd, events, maxevents,
++      rc = epoll_pwait(GetHostFd(epfd), events, maxevents,
+                        ConvertTimeToInt(ToMilliseconds(waitfor)), &oldmask);
+ #endif
+       if (rc == -1 && errno == EINTR) {
+diff --git a/blink/syscall.h b/blink/syscall.h
+index 87a351c..b4f281f 100644
+--- a/blink/syscall.h
++++ b/blink/syscall.h
+@@ -68,6 +68,11 @@ _Noreturn void SysExitGroup(struct Machine *, int);
+ _Noreturn void SysExit(struct Machine *, int);
+ 
+ int GetDirFildes(int);
++#ifdef HAVE_VIRTUAL_FDS
++int GetHostFd(int);
++#else
++#define GetHostFd(fildes) (fildes)
++#endif
+ void AddStdFd(struct Fds *, int);
+ int GetOflags(struct Machine *, int);
+ int GetFildes(struct Machine *, int);
+-- 
+2.53.0
+
